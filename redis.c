@@ -835,12 +835,12 @@ static struct redisCommand cmdTable[] = {
     {"shutdown",shutdownCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"lastsave",lastsaveCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"type",typeCommand,2,REDIS_CMD_INLINE,NULL,1,1,1},
-	{"registerslave",registerslaveCommand,1,REDIS_CMD_INLINE},
+	{"registerslave",registerslaveCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"multi",multiCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"exec",execCommand,1,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,execBlockClientOnSwappedKeys,0,0,0},
     {"discard",discardCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"sync",syncCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
-	{"syncmaster",syncmasterCommand,1,REDIS_CMD_INLINE},
+	{"syncmaster",syncmasterCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"flushdb",flushdbCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"flushall",flushallCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"sort",sortCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,NULL,1,1,1},
@@ -7979,10 +7979,9 @@ static void updateSlavesWaitingBgsave(int bgsaveerr) {
 }
 
 static int registerWithMaster(void) {
-    char buf[1024], tmpfile[256], authcmd[1024];
-    long dumpsize;
+    char buf[1024], authcmd[1024];
+
     int fd = anetTcpConnect(NULL,server.masterhost,server.masterport);
-    int dfd, maxtries = 5;
 
     if (fd == -1) {
         redisLog(REDIS_WARNING,"Unable to connect to MASTER: %s",
