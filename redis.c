@@ -54,6 +54,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/uio.h>
 #include <limits.h>
@@ -344,6 +345,7 @@ struct redisServer {
     int port;
     int fd;
     redisDb *db;
+    FILE *dbsavelockfp;
     long long dirty;            /* changes to DB from the last save */
     list *clients;
     list *slaves, *monitors;
@@ -560,6 +562,7 @@ static int rdbSaveBackground(char *filename);
 static robj *createStringObject(char *ptr, size_t len);
 static robj *dupStringObject(robj *o);
 static void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc);
+static int registerWithMaster(void);
 static void replicationFeedMonitors(list *monitors, int dictid, robj **argv, int argc);
 static void flushAppendOnlyFile(void);
 static void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int argc);
@@ -679,7 +682,9 @@ static void sunionCommand(redisClient *c);
 static void sunionstoreCommand(redisClient *c);
 static void sdiffCommand(redisClient *c);
 static void sdiffstoreCommand(redisClient *c);
+static void registerslaveCommand(redisClient *c);
 static void syncCommand(redisClient *c);
+static void syncmasterCommand(redisClient *c);
 static void flushdbCommand(redisClient *c);
 static void flushallCommand(redisClient *c);
 static void sortCommand(redisClient *c);
@@ -830,10 +835,12 @@ static struct redisCommand cmdTable[] = {
     {"shutdown",shutdownCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"lastsave",lastsaveCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"type",typeCommand,2,REDIS_CMD_INLINE,NULL,1,1,1},
+	{"registerslave",registerslaveCommand,1,REDIS_CMD_INLINE},
     {"multi",multiCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"exec",execCommand,1,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,execBlockClientOnSwappedKeys,0,0,0},
     {"discard",discardCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"sync",syncCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
+	{"syncmaster",syncmasterCommand,1,REDIS_CMD_INLINE},
     {"flushdb",flushdbCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"flushall",flushallCommand,1,REDIS_CMD_INLINE,NULL,0,0,0},
     {"sort",sortCommand,-2,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM,NULL,1,1,1},
@@ -1468,6 +1475,10 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
             }
             updateDictResizePolicy();
         }
+
+		if (flock(fileno(server.dbsavelockfp), LOCK_UN) == -1) {
+        	redisLog(REDIS_DEBUG, "Unable to release db save lock.");
+        }
     } else {
         /* If there is not a background saving in progress check if
          * we have to save now */
@@ -1477,6 +1488,11 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
 
             if (server.dirty >= sp->changes &&
                 now-server.lastsave > sp->seconds) {
+                /* acquire non-blocking file system dump lock */
+                if (flock(fileno(server.dbsavelockfp), LOCK_EX|LOCK_NB) == -1) {
+                	break;
+                }
+
                 redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
                     sp->changes, sp->seconds);
                 rdbSaveBackground(server.dbfilename);
@@ -1546,8 +1562,8 @@ static int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientD
     /* Check if we should connect to a MASTER */
     if (server.replstate == REDIS_REPL_CONNECT && !(loops % 10)) {
         redisLog(REDIS_NOTICE,"Connecting to MASTER...");
-        if (syncWithMaster() == REDIS_OK) {
-            redisLog(REDIS_NOTICE,"MASTER <-> SLAVE sync succeeded");
+        if (registerWithMaster() == REDIS_OK) {
+            redisLog(REDIS_NOTICE,"MASTER <-> SLAVE registration succeeded");
             if (server.appendonly) rewriteAppendOnlyFileBackground();
         }
     }
@@ -7774,6 +7790,16 @@ static int syncReadLine(int fd, char *ptr, ssize_t size, int timeout) {
     return nread;
 }
 
+static void registerslaveCommand(redisClient *c) {
+    /* ignore registerslave if aleady slave or in monitor mode */
+    if (c->flags & REDIS_SLAVE) return;
+    c->repldbfd = -1;
+    c->flags |= REDIS_SLAVE;
+    c->slaveseldb = 0;
+    listAddNodeTail(server.slaves,c);
+    return;
+}
+
 static void syncCommand(redisClient *c) {
     /* ignore SYNC if aleady slave or in monitor mode */
     if (c->flags & REDIS_SLAVE) return;
@@ -7831,6 +7857,13 @@ static void syncCommand(redisClient *c) {
     c->slaveseldb = 0;
     listAddNodeTail(server.slaves,c);
     return;
+}
+
+static void syncmasterCommand(redisClient *c) {
+    redisLog(REDIS_NOTICE,"Connecting to MASTER...");
+     if (syncWithMaster() == REDIS_OK) {
+    	 redisLog(REDIS_NOTICE,"MASTER <-> SLAVE sync succeeded");
+     }
 }
 
 static void sendBulkToSlave(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -7944,6 +7977,58 @@ static void updateSlavesWaitingBgsave(int bgsaveerr) {
         }
     }
 }
+
+static int registerWithMaster(void) {
+    char buf[1024], tmpfile[256], authcmd[1024];
+    long dumpsize;
+    int fd = anetTcpConnect(NULL,server.masterhost,server.masterport);
+    int dfd, maxtries = 5;
+
+    if (fd == -1) {
+        redisLog(REDIS_WARNING,"Unable to connect to MASTER: %s",
+            strerror(errno));
+        return REDIS_ERR;
+    }
+
+    /* AUTH with the master if required. */
+    if(server.masterauth) {
+    	snprintf(authcmd, 1024, "AUTH %s\r\n", server.masterauth);
+    	if (syncWrite(fd, authcmd, strlen(server.masterauth)+7, 5) == -1) {
+            close(fd);
+            redisLog(REDIS_WARNING,"Unable to AUTH to MASTER: %s",
+                strerror(errno));
+            return REDIS_ERR;
+    	}
+        /* Read the AUTH result.  */
+        if (syncReadLine(fd,buf,1024,3600) == -1) {
+            close(fd);
+            redisLog(REDIS_WARNING,"I/O error reading auth result from MASTER: %s",
+                strerror(errno));
+            return REDIS_ERR;
+        }
+        if (buf[0] != '+') {
+            close(fd);
+            redisLog(REDIS_WARNING,"Cannot AUTH to MASTER, is the masterauth password correct?");
+            return REDIS_ERR;
+        }
+    }
+
+
+    /* Issue the REGISTERSLAVE command */
+    if (syncWrite(fd,"REGISTERSLAVE \r\n",16,5) == -1) {
+        close(fd);
+        redisLog(REDIS_WARNING,"I/O error writing to MASTER: %s",
+            strerror(errno));
+        return REDIS_ERR;
+    }
+
+    server.master = createClient(fd);
+    server.master->flags |= REDIS_MASTER;
+    server.master->authenticated = 1;
+    server.replstate = REDIS_REPL_CONNECTED;
+    return REDIS_OK;
+}
+
 
 static int syncWithMaster(void) {
     char buf[1024], tmpfile[256], authcmd[1024];
