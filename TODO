@@ -1,42 +1,31 @@
 Redis TODO and Roadmap
+----------------------
 
-VERSION 2.2 TODO
-================
-
-* BRPOPLPUSH
-* Save dataset / fsync() on SIGTERM
-* Change the implementation of ZCOUNT to use the augmented skiplist in order to be much faster.
-* Write doc for ZCOUNT, and for open / closed intervals of sorted sets range operations.
-
-Virtual Memory sub-TODO:
-* Use multiple open FDs against the VM file, one for thread.
-* vm-min-age <seconds> option
-* Check what happens performance-wise if instead to create threads again and again the same threads are reused forever. Note: this requires a way to disable this clients in the child, but waiting for empty new jobs queue can be enough.
-
-* Implement LEN, PEEK, POKE, SETBIT, GETBIT
-
-VERSION 2.2 TODO (Fault tolerant sharding)
-===========================================
-
-* Redis-cluster, a fast intermediate layer (proxy) that implements consistent hashing and fault tollerant nodes handling.
-
-Interesting readings about this:
-
-    - http://ayende.com/Blog/archive/2009/04/06/designing-rhino-dht-a-fault-tolerant-dynamically-distributed-hash.aspx
-
-VERSION 2.4 TODO (Optimizations and latency)
+VERSION 2.2 TODO (Optimizations and latency)
 ============================================
 
-* Lower the CPU usage.
-* Lower the RAM usage everywhere possible.
-* Use epool and alike to rewrite ae.c for Linux and other platforms suppporting fater-than-select() mutiplexing APIs.
-* Implement an UDP interface for low-latency GET/SET operations.
+* Support for syslog(3).
+* Change the implementation of ZCOUNT to use the augmented skiplist in order to be much faster.
+* Add an explicit test for MULTI/EXEC reloaded in the AOF.
+* Command table -> hash table, with support for command renaming
+
+VM TODO
+=======
+
+* Use multiple open FDs against the VM file, one for thread.
+* Check what happens performance-wise if instead of creating threads again and again the same threads are reused forever. Note: this requires a way to disable this clients in the child, but waiting for empty new jobs queue can be enough.
+
+STRING COMMANDS
+===============
+
+* Implement STRLEN, PEEK, POKE, SETBIT, GETBIT
 
 OTHER IMPORTANT THINGS THAT WILL BE ADDED BUT I'M NOT SURE WHEN
 ===============================================================
 
 BIG ONES:
 
+* BRPOPLPUSH
 * Specially encoded memory-saving integer sets.
 * A command to export a JSON dump (there should be mostly working patch needing major reworking).
 * Specially encoded sets of integers (this includes a big refactoring providing an higher level layer for Sets manipulation)
@@ -58,18 +47,20 @@ THE "MAYBE" TODO LIST: things that may or may not get implemented
 Most of this can be seen just as proposals, the fact they are in this list
 it's not a guarantee they'll ever get implemented ;)
 
-* Move dict.c from hash table to skip list, in order to avoid the blocking resize operation needed for the hash table.
-* FORK command (fork()s executing the commands received by the current
-  client in the new process). Hint: large SORTs can use more cores,
-  copy-on-write will avoid memory problems.
-* DUP command? DUP srckey dstkey, creates an exact clone of srckey value in dstkey.
 * SORT: Don't copy the list into a vector when BY argument is constant.
 * Write the hash table size of every db in the dump, so that Redis can resize the hash table just one time when loading a big DB.
-* LOCK / TRYLOCK / UNLOCK as described many times in the google group
-* Replication automated tests
 * Byte Array type (BA prefixed commands): BASETBIT BAGETBIT BASETU8 U16 U32 U64 S8 S16 S32 S64, ability to atomically INCRBY all the base types. BARANGE to get a range of bytes as a bulk value, BASETRANGE to set a range of bytes.
-* zmalloc() should avoid to add a private header for archs where there is some other kind of libc-specific way to get the size of a malloced block. Already done for Mac OS X.
 * Read-only mode.
-* Pattern-matching replication.
-* Add an option to relax the delete-expiring-keys-on-write semantic *denying* replication and AOF when this is on? Can be handy sometimes, when using Redis for non persistent state, but can create problems. For instance should rename and move also "move" the timeouts? How does this affect other commands?
+* Kill the delete-on-write behavior of expires, replicating DELs
 * Multiple BY in SORT.
+
+KNOWN BUGS
+==========
+
+* LRANGE and other commands are using 32 bit integers for ranges, and overflows are not detected. So LRANGE mylist 0 23498204823094823904823904 will have random effects.
+
+REDIS CLI TODO
+==============
+
+* Computer parsable output generation
+* Memoize return values so that they can be used later as arguments, like $1
