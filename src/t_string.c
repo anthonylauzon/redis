@@ -17,7 +17,6 @@ void setGenericCommand(redisClient *c, int nx, robj *key, robj *val, robj *expir
         }
     }
 
-    if (nx) deleteIfVolatile(c->db,key);
     retval = dbAdd(c->db,key,val);
     if (retval == REDIS_ERR) {
         if (!nx) {
@@ -252,4 +251,13 @@ void substrCommand(redisClient *c) {
     decrRefCount(o);
 }
 
+void strlenCommand(redisClient *c) {
+    robj *o;
 
+    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
+        checkType(c,o,REDIS_STRING)) return;
+
+    o = getDecodedObject(o);
+    addReplyLongLong(c,sdslen(o->ptr));
+    decrRefCount(o);
+}
