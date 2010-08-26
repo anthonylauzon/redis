@@ -752,6 +752,7 @@ void initServerConfig() {
     server.hash_max_zipmap_value = REDIS_HASH_MAX_ZIPMAP_VALUE;
     server.list_max_ziplist_entries = REDIS_LIST_MAX_ZIPLIST_ENTRIES;
     server.list_max_ziplist_value = REDIS_LIST_MAX_ZIPLIST_VALUE;
+    server.set_max_intset_entries = REDIS_SET_MAX_INTSET_ENTRIES;
     server.shutdown_asap = 0;
 
     resetServerSaveParams();
@@ -922,9 +923,14 @@ int processCommand(redisClient *c) {
                 resetClient(c);
                 return 1;
             } else {
-                int bulklen = atoi(((char*)c->argv[0]->ptr)+1);
+                char *eptr;
+                long bulklen = strtol(((char*)c->argv[0]->ptr)+1,&eptr,10);
+                int perr = eptr[0] != '\0';
+
                 decrRefCount(c->argv[0]);
-                if (bulklen < 0 || bulklen > 1024*1024*1024) {
+                if (perr || bulklen == LONG_MIN || bulklen == LONG_MAX ||
+                    bulklen < 0 || bulklen > 1024*1024*1024)
+                {
                     c->argc--;
                     addReplySds(c,sdsnew("-ERR invalid bulk write count\r\n"));
                     resetClient(c);
@@ -994,10 +1000,14 @@ int processCommand(redisClient *c) {
         return 1;
     } else if (cmd->flags & REDIS_CMD_BULK && c->bulklen == -1) {
         /* This is a bulk command, we have to read the last argument yet. */
-        int bulklen = atoi(c->argv[c->argc-1]->ptr);
+        char *eptr;
+        long bulklen = strtol(c->argv[c->argc-1]->ptr,&eptr,10);
+        int perr = eptr[0] != '\0';
 
         decrRefCount(c->argv[c->argc-1]);
-        if (bulklen < 0 || bulklen > 1024*1024*1024) {
+        if (perr || bulklen == LONG_MAX || bulklen == LONG_MIN ||
+            bulklen < 0 || bulklen > 1024*1024*1024)
+        {
             c->argc--;
             addReplySds(c,sdsnew("-ERR invalid bulk write count\r\n"));
             resetClient(c);
@@ -1086,11 +1096,7 @@ int prepareForShutdown() {
         if (server.vm_enabled) unlink(server.vm_swap_file);
     } else {
         /* Snapshotting. Perform a SYNC SAVE and exit */
-        if (rdbSave(server.dbfilename) == REDIS_OK) {
-            if (server.daemonize)
-                unlink(server.pidfile);
-            redisLog(REDIS_WARNING,"%zu bytes used at exit",zmalloc_used_memory());
-        } else {
+        if (rdbSave(server.dbfilename) != REDIS_OK) {
             /* Ooops.. error saving! The best we can do is to continue
              * operating. Note that if there was a background saving process,
              * in the next cron() Redis will be notified that the background
@@ -1100,6 +1106,7 @@ int prepareForShutdown() {
             return REDIS_ERR;
         }
     }
+    if (server.daemonize) unlink(server.pidfile);
     redisLog(REDIS_WARNING,"Server exit now, bye bye...");
     return REDIS_OK;
 }
@@ -1372,9 +1379,17 @@ void linuxOvercommitMemoryWarning(void) {
 }
 #endif /* __linux__ */
 
+void createPidFile(void) {
+    /* Try to write the pid file in a best-effort way. */
+    FILE *fp = fopen(server.pidfile,"w");
+    if (fp) {
+        fprintf(fp,"%d\n",getpid());
+        fclose(fp);
+    }
+}
+
 void daemonize(void) {
     int fd;
-    FILE *fp;
 
     if (fork() != 0) exit(0); /* parent exits */
     setsid(); /* create a new session */
@@ -1387,12 +1402,6 @@ void daemonize(void) {
         dup2(fd, STDOUT_FILENO);
         dup2(fd, STDERR_FILENO);
         if (fd > STDERR_FILENO) close(fd);
-    }
-    /* Try to write the pid file */
-    fp = fopen(server.pidfile,"w");
-    if (fp) {
-        fprintf(fp,"%d\n",getpid());
-        fclose(fp);
     }
 }
 
@@ -1426,6 +1435,7 @@ int main(int argc, char **argv) {
     }
     if (server.daemonize) daemonize();
     initServer();
+    if (server.daemonize) createPidFile();
     redisLog(REDIS_NOTICE,"Server started, Redis version " REDIS_VERSION);
 #ifdef __linux__
     linuxOvercommitMemoryWarning();
@@ -1502,6 +1512,7 @@ void segvHandler(int sig, siginfo_t *info, void *secret) {
         redisLog(REDIS_WARNING,"%s", messages[i]);
 
     /* free(messages); Don't call free() with possibly corrupted memory. */
+    if (server.daemonize) unlink(server.pidfile);
     _exit(0);
 }
 
