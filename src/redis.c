@@ -1350,7 +1350,7 @@ void freeMemoryIfNeeded(void) {
                     }
                 }
                 keyobj = createStringObject(minkey,sdslen(minkey));
-                dbDelete(server.db+j, keyobj);
+                dbDelete(server.db+j,keyobj);
                 decrRefCount(keyobj);
             }
         }
