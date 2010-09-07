@@ -579,7 +579,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                 }
                 redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
                     sp->changes, sp->seconds);
-                rdbSaveBackground(server.dbfilename);
+                //rdbSaveBackground(server.dbfilename);
                 break;
             }
          }
@@ -1096,7 +1096,8 @@ int prepareForShutdown() {
         if (server.vm_enabled) unlink(server.vm_swap_file);
     } else {
         /* Snapshotting. Perform a SYNC SAVE and exit */
-        if (rdbSave(server.dbfilename) != REDIS_OK) {
+    	/* alauzon: disabling save for now... */
+        if ( 0 ) { //&& (rdbSave(server.dbfilename) != REDIS_OK) ) {
             /* Ooops.. error saving! The best we can do is to continue
              * operating. Note that if there was a background saving process,
              * in the next cron() Redis will be notified that the background
@@ -1107,6 +1108,7 @@ int prepareForShutdown() {
         }
     }
     if (server.daemonize) unlink(server.pidfile);
+
     redisLog(REDIS_WARNING,"Server exit now, bye bye...");
     return REDIS_OK;
 }
@@ -1330,7 +1332,6 @@ void freeMemoryIfNeeded(void) {
 
         if (tryFreeOneObjectFromFreelist() == REDIS_OK) continue;
         for (j = 0; j < server.dbnum; j++) {
-            int minttl = -1;
             sds minkey = NULL;
             robj *keyobj = NULL;
             struct dictEntry *de;
@@ -1339,19 +1340,14 @@ void freeMemoryIfNeeded(void) {
                 freed = 1;
                 /* From a sample of three keys drop the one nearest to
                  * the natural expire */
-                for (k = 0; k < 3; k++) {
-                    time_t t;
-
+                for (k = 0; k < REDIS_NUM_DELETE_FREEING; k++) {
                     de = dictGetRandomKey(server.db[j].expires);
-                    t = (time_t) dictGetEntryVal(de);
-                    if (minttl == -1 || t < minttl) {
-                        minkey = dictGetEntryKey(de);
-                        minttl = t;
-                    }
+                    minkey = dictGetEntryKey(de);
+                    keyobj = createStringObject(minkey,sdslen(minkey));
+                    dbDelete(server.db+j,keyobj);
+                    decrRefCount(keyobj);
                 }
-                keyobj = createStringObject(minkey,sdslen(minkey));
-                dbDelete(server.db+j,keyobj);
-                decrRefCount(keyobj);
+
             }
         }
         if (!freed) return; /* nothing to free... */

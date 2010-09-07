@@ -199,6 +199,9 @@
 #define REDIS_OP_DIFF 1
 #define REDIS_OP_INTER 2
 
+/* Number of keys to remove when freeing memory */
+#define REDIS_NUM_DELETE_FREEING 100
+
 /* We can print the stacktrace, so our assert is defined this way: */
 #define redisAssert(_e) ((_e)?(void)0 : (_redisAssert(#_e,__FILE__,__LINE__),_exit(1)))
 #define redisPanic(_e) _redisPanic(#_e,__FILE__,__LINE__),_exit(1)
