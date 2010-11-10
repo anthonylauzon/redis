@@ -453,6 +453,13 @@ werr:
 }
 
 int rdbSaveBackground(char *filename) {
+    if (flock(fileno(server.dbsavelockfp), LOCK_EX|LOCK_NB) == -1) {
+    	server.bgsaveneeded = 1;
+    	return REDIS_OK;
+    } else {
+    	server.bgsaveneeded = 0;
+    }
+
     pid_t childpid;
 
     if (server.bgsavechildpid != -1) return REDIS_ERR;
@@ -461,11 +468,18 @@ int rdbSaveBackground(char *filename) {
         /* Child */
         if (server.vm_enabled) vmReopenSwapFile();
         close(server.fd);
+
+        int ret_val = 1;
+
         if (rdbSave(filename) == REDIS_OK) {
-            _exit(0);
-        } else {
-            _exit(1);
+            ret_val = 0;
         }
+
+    	if (flock(fileno(server.dbsavelockfp), LOCK_UN) == -1) {
+        	redisLog(REDIS_DEBUG, "Unable to release db save lock.");
+        }
+
+    	_exit(ret_val);
     } else {
         /* Parent */
         if (childpid == -1) {
@@ -478,6 +492,7 @@ int rdbSaveBackground(char *filename) {
         updateDictResizePolicy();
         return REDIS_OK;
     }
+
     return REDIS_OK; /* unreached */
 }
 

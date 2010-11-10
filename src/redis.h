@@ -340,6 +340,7 @@ struct redisServer {
     int fd;
     redisDb *db;
     FILE *dbsavelockfp;
+    int bgsaveneeded;
     long long dirty;            /* changes to DB from the last save */
     list *clients;
     list *slaves, *monitors;

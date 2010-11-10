@@ -561,28 +561,10 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             }
             updateDictResizePolicy();
         }
-		if (flock(fileno(server.dbsavelockfp), LOCK_UN) == -1) {
-        	redisLog(REDIS_DEBUG, "Unable to release db save lock.");
-        }
     } else {
-        /* If there is not a background saving in progress check if
-         * we have to save now */
-         time_t now = time(NULL);
-         for (j = 0; j < server.saveparamslen; j++) {
-            struct saveparam *sp = server.saveparams+j;
-
-            if (server.dirty >= sp->changes &&
-                now-server.lastsave > sp->seconds) {
-                /* acquire non-blocking file system dump lock */
-                if (flock(fileno(server.dbsavelockfp), LOCK_EX|LOCK_NB) == -1) {
-                	break;
-                }
-                redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
-                    sp->changes, sp->seconds);
-                //rdbSaveBackground(server.dbfilename);
-                break;
-            }
-         }
+    	if (server.bgsaveneeded) {
+    		rdbSaveBackground(server.dbfilename);
+    	}
     }
 
     /* Expire a few keys per cycle, only if this is a master.
@@ -768,6 +750,7 @@ void initServerConfig() {
     server.master = NULL;
     server.replstate = REDIS_REPL_NONE;
     server.dbsavelockfp = fopen("dbsave.lock", "a");
+    server.bgsaveneeded = 0;
 
     /* Double constants initialization */
     R_Zero = 0.0;
