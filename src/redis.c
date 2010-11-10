@@ -753,6 +753,7 @@ void initServerConfig() {
     server.maxmemory = 0;
     server.maxmemory_policy = REDIS_MAXMEMORY_VOLATILE_LRU;
     server.maxmemory_samples = 3;
+    server.maxmemory_freecount = 1;
     server.vm_enabled = 0;
     server.vm_swap_file = zstrdup("/tmp/redis-%p.vm");
     server.vm_page_size = 256;          /* 256 bytes per page */
@@ -1332,7 +1333,7 @@ void freeMemoryIfNeeded(void) {
 
     while (server.maxmemory && zmalloc_used_memory() > server.maxmemory) {
         int i, j, k, freed = 0;
-        for (i = 0; i < REDIS_NUM_DELETE_FREEING; i++) {
+        for (i = 0; i < server.maxmemory_freecount; i++) {
 			for (j = 0; j < server.dbnum; j++) {
 				long bestval = 0; /* just to prevent warning */
 				sds bestkey = NULL;
@@ -1368,6 +1369,7 @@ void freeMemoryIfNeeded(void) {
 
 						de = dictGetRandomKey(dict);
 						thiskey = dictGetEntryKey(de);
+						de = dictFind(db->dict, thiskey);
 						o = dictGetEntryVal(de);
 						thisval = estimateObjectIdleTime(o);
 
@@ -1418,25 +1420,27 @@ void freeMemoryIfNeeded(void) {
             sds minkey = NULL;
             robj *keyobj = NULL;
             struct dictEntry *de;
+            int i;
+            for (i = 0; i < server.maxmemory_freecount; i++) {
+				if (dictSize(server.db[j].expires)) {
+					freed = 1;
+					/* From a sample of three keys drop the one nearest to
+					 * the natural expire */
+					for (k = 0; k < 3; k++) {
+						time_t t;
 
-            if (dictSize(server.db[j].expires)) {
-                freed = 1;
-                /* From a sample of three keys drop the one nearest to
-                 * the natural expire */
-                for (k = 0; k < 3; k++) {
-                    time_t t;
-
-                    de = dictGetRandomKey(server.db[j].expires);
-                    t = (time_t) dictGetEntryVal(de);
-                    if (minttl == -1 || t < minttl) {
-                        minkey = dictGetEntryKey(de);
-                        minttl = t;
-                    }
-                }
-                keyobj = createStringObject(minkey,sdslen(minkey));
-                dbDelete(server.db+j,keyobj);
-                server.stat_expiredkeys++;
-                decrRefCount(keyobj);
+						de = dictGetRandomKey(server.db[j].expires);
+						t = (time_t) dictGetEntryVal(de);
+						if (minttl == -1 || t < minttl) {
+							minkey = dictGetEntryKey(de);
+							minttl = t;
+						}
+					}
+					keyobj = createStringObject(minkey,sdslen(minkey));
+					dbDelete(server.db+j,keyobj);
+					server.stat_expiredkeys++;
+					decrRefCount(keyobj);
+				}
             }
         }
         if (!freed) return; /* nothing to free... */

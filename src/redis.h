@@ -205,10 +205,6 @@
 #define REDIS_OP_DIFF 1
 #define REDIS_OP_INTER 2
 
-
-/* Number of keys to remove when freeing memory */
-#define REDIS_NUM_DELETE_FREEING 100
-
 /* Redis maxmemory strategies */
 #define REDIS_MAXMEMORY_VOLATILE_LRU 0
 #define REDIS_MAXMEMORY_VOLATILE_TTL 1
@@ -435,6 +431,7 @@ struct redisServer {
     unsigned long long maxmemory;
     int maxmemory_policy;
     int maxmemory_samples;
+    int maxmemory_freecount;
     /* Blocked clients */
     unsigned int blpop_blocked_clients;
     unsigned int vm_blocked_clients;
