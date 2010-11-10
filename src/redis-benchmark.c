@@ -40,21 +40,14 @@
 #include <assert.h>
 
 #include "ae.h"
-#include "anet.h"
+#include "hiredis.h"
 #include "sds.h"
 #include "adlist.h"
 #include "zmalloc.h"
 
-#define REPLY_INT 0
-#define REPLY_RETCODE 1
-#define REPLY_BULK 2
-#define REPLY_MBULK 3
-
 #define CLIENT_CONNECTING 0
 #define CLIENT_SENDQUERY 1
 #define CLIENT_READREPLY 2
-
-#define MAX_LATENCY 5000
 
 #define REDIS_NOTUSED(V) ((void) V)
 
@@ -71,10 +64,12 @@ static struct config {
     aeEventLoop *el;
     char *hostip;
     int hostport;
+    char *hostsocket;
     int keepalive;
     long long start;
     long long totlatency;
-    int *latency;
+    long long *latency;
+    char *title;
     list *clients;
     int quiet;
     int loop;
@@ -82,16 +77,13 @@ static struct config {
 } config;
 
 typedef struct _client {
+    redisContext *context;
     int state;
-    int fd;
     sds obuf;
-    sds ibuf;
-    int mbulk;          /* Number of elements in an mbulk reply */
-    int readlen;        /* readlen == -1 means read a single line */
-    int totreceived;
-    unsigned int written;        /* bytes of 'obuf' already written */
+    unsigned int written; /* bytes of 'obuf' already written */
     int replytype;
-    long long start;    /* start time in milliseconds */
+    long long start; /* start time of a request */
+    long long latency; /* request latency */
 } *client;
 
 /* Prototypes */
@@ -99,6 +91,16 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 static void createMissingClients(client c);
 
 /* Implementation */
+static long long ustime(void) {
+    struct timeval tv;
+    long long ust;
+
+    gettimeofday(&tv, NULL);
+    ust = ((long)tv.tv_sec)*1000000;
+    ust += tv.tv_usec;
+    return ust;
+}
+
 static long long mstime(void) {
     struct timeval tv;
     long long mst;
@@ -111,12 +113,10 @@ static long long mstime(void) {
 
 static void freeClient(client c) {
     listNode *ln;
-
-    aeDeleteFileEvent(config.el,c->fd,AE_WRITABLE);
-    aeDeleteFileEvent(config.el,c->fd,AE_READABLE);
-    sdsfree(c->ibuf);
+    aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
+    aeDeleteFileEvent(config.el,c->context->fd,AE_READABLE);
+    redisFree(c->context);
     sdsfree(c->obuf);
-    close(c->fd);
     zfree(c);
     config.liveclients--;
     ln = listSearchKey(config.clients,c);
@@ -135,19 +135,13 @@ static void freeAllClients(void) {
 }
 
 static void resetClient(client c) {
-    aeDeleteFileEvent(config.el,c->fd,AE_WRITABLE);
-    aeDeleteFileEvent(config.el,c->fd,AE_READABLE);
-    aeCreateFileEvent(config.el,c->fd, AE_WRITABLE,writeHandler,c);
-    sdsfree(c->ibuf);
-    c->ibuf = sdsempty();
-    c->readlen = (c->replytype == REPLY_BULK ||
-                  c->replytype == REPLY_MBULK) ? -1 : 0;
-    c->mbulk = -1;
+    aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
+    aeDeleteFileEvent(config.el,c->context->fd,AE_READABLE);
+    aeCreateFileEvent(config.el,c->context->fd,AE_WRITABLE,writeHandler,c);
     c->written = 0;
-    c->totreceived = 0;
     c->state = CLIENT_SENDQUERY;
-    c->start = mstime();
-    createMissingClients(c);
+    c->start = ustime();
+    c->latency = -1;
 }
 
 static void randomizeClientKey(client c) {
@@ -163,33 +157,7 @@ static void randomizeClientKey(client c) {
     memcpy(p,buf,strlen(buf));
 }
 
-static void prepareClientForReply(client c, int type) {
-    if (type == REPLY_BULK) {
-        c->replytype = REPLY_BULK;
-        c->readlen = -1;
-    } else if (type == REPLY_MBULK) {
-        c->replytype = REPLY_MBULK;
-        c->readlen = -1;
-        c->mbulk = -1;
-    } else {
-        c->replytype = type;
-        c->readlen = 0;
-    }
-}
-
 static void clientDone(client c) {
-    static int last_tot_received = 1;
-
-    long long latency;
-    config.donerequests ++;
-    latency = mstime() - c->start;
-    if (latency > MAX_LATENCY) latency = MAX_LATENCY;
-    config.latency[latency]++;
-
-    if (config.debug && last_tot_received != c->totreceived) {
-        printf("Tot bytes received: %d\n", c->totreceived);
-        last_tot_received = c->totreceived;
-    }
     if (config.donerequests == config.requests) {
         freeClient(c);
         aeStop(config.el);
@@ -206,108 +174,35 @@ static void clientDone(client c) {
     }
 }
 
-static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask)
-{
-    char buf[1024];
-    int nread;
+static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
+    void *reply = NULL;
     REDIS_NOTUSED(el);
     REDIS_NOTUSED(fd);
     REDIS_NOTUSED(mask);
 
-    nread = read(c->fd, buf, 1024);
-    if (nread == -1) {
-        fprintf(stderr, "Reading from socket: %s\n", strerror(errno));
-        freeClient(c);
-        return;
-    }
-    if (nread == 0) {
-        fprintf(stderr, "EOF from client\n");
-        freeClient(c);
-        return;
-    }
-    c->totreceived += nread;
-    c->ibuf = sdscatlen(c->ibuf,buf,nread);
+    /* Calculate latency only for the first read event. This means that the
+     * server already sent the reply and we need to parse it. Parsing overhead
+     * is not part of the latency, so calculate it only once, here. */
+    if (c->latency < 0) c->latency = ustime()-(c->start);
 
-processdata:
-    /* Are we waiting for the first line of the command of for  sdf 
-     * count in bulk or multi bulk operations? */
-    if (c->replytype == REPLY_INT ||
-        c->replytype == REPLY_RETCODE ||
-        (c->replytype == REPLY_BULK && c->readlen == -1) ||
-        (c->replytype == REPLY_MBULK && c->readlen == -1) ||
-        (c->replytype == REPLY_MBULK && c->mbulk == -1)) {
-        char *p;
-
-        /* Check if the first line is complete. This is only true if
-         * there is a newline inside the buffer. */
-        if ((p = strchr(c->ibuf,'\n')) != NULL) {
-            if (c->replytype == REPLY_BULK ||
-                (c->replytype == REPLY_MBULK && c->mbulk != -1))
-            {
-                /* Read the count of a bulk reply (being it a single bulk or
-                 * a multi bulk reply). "$<count>" for the protocol spec. */
-                *p = '\0';
-                *(p-1) = '\0';
-                c->readlen = atoi(c->ibuf+1)+2;
-                // printf("BULK ATOI: %s\n", c->ibuf+1);
-                /* Handle null bulk reply "$-1" */
-                if (c->readlen-2 == -1) {
-                    clientDone(c);
-                    return;
-                }
-                /* Leave all the rest in the input buffer */
-                c->ibuf = sdsrange(c->ibuf,(p-c->ibuf)+1,-1);
-                /* fall through to reach the point where the code will try
-                 * to check if the bulk reply is complete. */
-            } else if (c->replytype == REPLY_MBULK && c->mbulk == -1) {
-                /* Read the count of a multi bulk reply. That is, how many
-                 * bulk replies we have to read next. "*<count>" protocol. */
-                *p = '\0';
-                *(p-1) = '\0';
-                c->mbulk = atoi(c->ibuf+1);
-                /* Handle null bulk reply "*-1" */
-                if (c->mbulk == -1) {
-                    clientDone(c);
-                    return;
-                }
-                // printf("%p) %d elements list\n", c, c->mbulk);
-                /* Leave all the rest in the input buffer */
-                c->ibuf = sdsrange(c->ibuf,(p-c->ibuf)+1,-1);
-                goto processdata;
-            } else {
-                c->ibuf = sdstrim(c->ibuf,"\r\n");
-                clientDone(c);
-                return;
-            }
+    if (redisBufferRead(c->context) != REDIS_OK) {
+        fprintf(stderr,"Error: %s\n",c->context->errstr);
+        exit(1);
+    } else {
+        if (redisGetReply(c->context,&reply) != REDIS_OK) {
+            fprintf(stderr,"Error: %s\n",c->context->errstr);
+            exit(1);
         }
-    }
-    /* bulk read, did we read everything? */
-    if (((c->replytype == REPLY_MBULK && c->mbulk != -1) || 
-         (c->replytype == REPLY_BULK)) && c->readlen != -1 &&
-          (unsigned)c->readlen <= sdslen(c->ibuf))
-    {
-        // printf("BULKSTATUS mbulk:%d readlen:%d sdslen:%d\n",
-        //    c->mbulk,c->readlen,sdslen(c->ibuf));
-        if (c->replytype == REPLY_BULK) {
+        if (reply != NULL) {
+            if (config.donerequests < config.requests)
+                config.latency[config.donerequests++] = c->latency;
             clientDone(c);
-        } else if (c->replytype == REPLY_MBULK) {
-            // printf("%p) %d (%d)) ",c, c->mbulk, c->readlen);
-            // fwrite(c->ibuf,c->readlen,1,stdout);
-            // printf("\n");
-            if (--c->mbulk == 0) {
-                clientDone(c);
-            } else {
-                c->ibuf = sdsrange(c->ibuf,c->readlen,-1);
-                c->readlen = -1;
-                goto processdata;
-            }
         }
     }
 }
 
-static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask)
-{
+static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
     REDIS_NOTUSED(el);
     REDIS_NOTUSED(fd);
@@ -315,12 +210,12 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask)
 
     if (c->state == CLIENT_CONNECTING) {
         c->state = CLIENT_SENDQUERY;
-        c->start = mstime();
+        c->start = ustime();
+        c->latency = -1;
     }
     if (sdslen(c->obuf) > c->written) {
         void *ptr = c->obuf+c->written;
-        int len = sdslen(c->obuf) - c->written;
-        int nwritten = write(c->fd, ptr, len);
+        int nwritten = write(c->context->fd,ptr,sdslen(c->obuf)-c->written);
         if (nwritten == -1) {
             if (errno != EPIPE)
                 fprintf(stderr, "Writing to socket: %s\n", strerror(errno));
@@ -329,84 +224,89 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask)
         }
         c->written += nwritten;
         if (sdslen(c->obuf) == c->written) {
-            aeDeleteFileEvent(config.el,c->fd,AE_WRITABLE);
-            aeCreateFileEvent(config.el,c->fd,AE_READABLE,readHandler,c);
+            aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
+            aeCreateFileEvent(config.el,c->context->fd,AE_READABLE,readHandler,c);
             c->state = CLIENT_READREPLY;
         }
     }
 }
 
-static client createClient(void) {
+static client createClient(int replytype) {
     client c = zmalloc(sizeof(struct _client));
-    char err[ANET_ERR_LEN];
-
-    c->fd = anetTcpNonBlockConnect(err,config.hostip,config.hostport);
-    if (c->fd == ANET_ERR) {
-        zfree(c);
-        fprintf(stderr,"Connect: %s\n",err);
-        return NULL;
+    if (config.hostsocket == NULL) {
+        c->context = redisConnectNonBlock(config.hostip,config.hostport);
+    } else {
+        c->context = redisConnectUnixNonBlock(config.hostsocket);
     }
-    anetTcpNoDelay(NULL,c->fd);
-    c->obuf = sdsempty();
-    c->ibuf = sdsempty();
-    c->mbulk = -1;
-    c->readlen = 0;
-    c->written = 0;
-    c->totreceived = 0;
+    if (c->context->err) {
+        fprintf(stderr,"Could not connect to Redis at ");
+        if (config.hostsocket == NULL)
+            fprintf(stderr,"%s:%d: %s\n",config.hostip,config.hostport,c->context->errstr);
+        else
+            fprintf(stderr,"%s: %s\n",config.hostsocket,c->context->errstr);
+        exit(1);
+    }
+    c->replytype = replytype;
     c->state = CLIENT_CONNECTING;
-    aeCreateFileEvent(config.el, c->fd, AE_WRITABLE, writeHandler, c);
-    config.liveclients++;
+    c->obuf = sdsempty();
+    c->written = 0;
+    redisSetReplyObjectFunctions(c->context,NULL);
+    aeCreateFileEvent(config.el,c->context->fd,AE_WRITABLE,writeHandler,c);
     listAddNodeTail(config.clients,c);
+    config.liveclients++;
     return c;
 }
 
 static void createMissingClients(client c) {
     while(config.liveclients < config.numclients) {
-        client new = createClient();
-        if (!new) continue;
+        client new = createClient(c->replytype);
         sdsfree(new->obuf);
         new->obuf = sdsdup(c->obuf);
         if (config.randomkeys) randomizeClientKey(c);
-        prepareClientForReply(new,c->replytype);
     }
 }
 
-static void showLatencyReport(char *title) {
-    int j, seen = 0;
+static int compareLatency(const void *a, const void *b) {
+    return (*(long long*)a)-(*(long long*)b);
+}
+
+static void showLatencyReport(void) {
+    int i, curlat = 0;
     float perc, reqpersec;
 
     reqpersec = (float)config.donerequests/((float)config.totlatency/1000);
     if (!config.quiet) {
-        printf("====== %s ======\n", title);
+        printf("====== %s ======\n", config.title);
         printf("  %d requests completed in %.2f seconds\n", config.donerequests,
             (float)config.totlatency/1000);
         printf("  %d parallel clients\n", config.numclients);
         printf("  %d bytes payload\n", config.datasize);
         printf("  keep alive: %d\n", config.keepalive);
         printf("\n");
-        for (j = 0; j <= MAX_LATENCY; j++) {
-            if (config.latency[j]) {
-                seen += config.latency[j];
-                perc = ((float)seen*100)/config.donerequests;
-                printf("%.2f%% <= %d milliseconds\n", perc, j);
+
+        qsort(config.latency,config.requests,sizeof(long long),compareLatency);
+        for (i = 0; i < config.requests; i++) {
+            if (config.latency[i]/1000 != curlat || i == (config.requests-1)) {
+                curlat = config.latency[i]/1000;
+                perc = ((float)(i+1)*100)/config.requests;
+                printf("%.2f%% <= %d milliseconds\n", perc, curlat);
             }
         }
         printf("%.2f requests per second\n\n", reqpersec);
     } else {
-        printf("%s: %.2f requests per second\n", title, reqpersec);
+        printf("%s: %.2f requests per second\n", config.title, reqpersec);
     }
 }
 
-static void prepareForBenchmark(void)
-{
-    memset(config.latency,0,sizeof(int)*(MAX_LATENCY+1));
+static void prepareForBenchmark(char *title) {
+    config.title = title;
     config.start = mstime();
     config.donerequests = 0;
 }
 
-static void endBenchmark(char *title) {
+static void endBenchmark(void) {
     config.totlatency = mstime()-config.start;
-    showLatencyReport(title);
+    showLatencyReport();
     freeAllClients();
 }
 
@@ -426,15 +326,13 @@ void parseOptions(int argc, char **argv) {
             config.keepalive = atoi(argv[i+1]);
             i++;
         } else if (!strcmp(argv[i],"-h") && !lastarg) {
-            char *ip = zmalloc(32);
-            if (anetResolve(NULL,argv[i+1],ip) == ANET_ERR) {
-                printf("Can't resolve %s\n", argv[i]);
-                exit(1);
-            }
-            config.hostip = ip;
+            config.hostip = argv[i+1];
             i++;
         } else if (!strcmp(argv[i],"-p") && !lastarg) {
             config.hostport = atoi(argv[i+1]);
+            i++;
+        } else if (!strcmp(argv[i],"-s") && !lastarg) {
+            config.hostsocket = argv[i+1];
             i++;
         } else if (!strcmp(argv[i],"-d") && !lastarg) {
             config.datasize = atoi(argv[i+1]);
@@ -459,7 +357,8 @@ void parseOptions(int argc, char **argv) {
             printf("Wrong option '%s' or option argument missing\n\n",argv[i]);
             printf("Usage: redis-benchmark [-h <host>] [-p <port>] [-c <clients>] [-n <requests]> [-k <boolean>]\n\n");
             printf(" -h <hostname>      Server hostname (default 127.0.0.1)\n");
-            printf(" -p <hostname>      Server port (default 6379)\n");
+            printf(" -p <port>          Server port (default 6379)\n");
+            printf(" -s <socket>        Server socket (overrides host and port)\n");
             printf(" -c <clients>       Number of parallel connections (default 50)\n");
             printf(" -n <requests>      Total number of requests (default 10000)\n");
             printf(" -d <size>          Data size of SET/GET value in bytes (default 2)\n");
@@ -480,6 +379,18 @@ void parseOptions(int argc, char **argv) {
     }
 }
 
+int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    REDIS_NOTUSED(eventLoop);
+    REDIS_NOTUSED(id);
+    REDIS_NOTUSED(clientData);
+
+    float dt = (float)(mstime()-config.start)/1000.0;
+    float rps = (float)config.donerequests/dt;
+    printf("%s: %.2f\r", config.title, rps);
+    fflush(stdout);
+    return 250; /* every 250ms */
+}
+
 int main(int argc, char **argv) {
     client c;
 
@@ -491,6 +402,7 @@ int main(int argc, char **argv) {
     config.requests = 10000;
     config.liveclients = 0;
     config.el = aeCreateEventLoop();
+    aeCreateTimeEvent(config.el,1,showThroughput,NULL,NULL);
     config.keepalive = 1;
     config.donerequests = 0;
     config.datasize = 3;
@@ -501,12 +413,12 @@ int main(int argc, char **argv) {
     config.idlemode = 0;
     config.latency = NULL;
     config.clients = listCreate();
-    config.latency = zmalloc(sizeof(int)*(MAX_LATENCY+1));
-
     config.hostip = "127.0.0.1";
     config.hostport = 6379;
+    config.hostsocket = NULL;
 
     parseOptions(argc,argv);
+    config.latency = zmalloc(sizeof(long long)*config.requests);
 
     if (config.keepalive == 0) {
         printf("WARNING: keepalive disabled, you probably need 'echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse' for Linux and 'sudo sysctl -w net.inet.tcp.msl=1000' for Mac OS X in order to use a lot of clients/requests\n");
@@ -514,149 +426,136 @@ int main(int argc, char **argv) {
 
     if (config.idlemode) {
         printf("Creating %d idle connections and waiting forever (Ctrl+C when done)\n", config.numclients);
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
+        prepareForBenchmark("IDLE");
+        c = createClient(0); /* will never receive a reply */
         c->obuf = sdsempty();
-        prepareClientForReply(c,REPLY_RETCODE); /* will never receive it */
         createMissingClients(c);
         aeMain(config.el);
         /* and will wait for every */
     }
 
     do {
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
+        prepareForBenchmark("PING");
+        c = createClient(REDIS_REPLY_STATUS);
         c->obuf = sdscat(c->obuf,"PING\r\n");
-        prepareClientForReply(c,REPLY_RETCODE);
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("PING");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
+        prepareForBenchmark("PING (multi bulk)");
+        c = createClient(REDIS_REPLY_STATUS);
         c->obuf = sdscat(c->obuf,"*1\r\n$4\r\nPING\r\n");
-        prepareClientForReply(c,REPLY_RETCODE);
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("PING (multi bulk)");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
-        c->obuf = sdscatprintf(c->obuf,"SET foo_rand000000000000 %d\r\n",config.datasize);
+        prepareForBenchmark("MSET (10 keys, multi bulk)");
+        c = createClient(REDIS_REPLY_ARRAY);
+        c->obuf = sdscatprintf(c->obuf,"*%d\r\n$4\r\nMSET\r\n", 11);
+        {
+            int i;
+            char *data = zmalloc(config.datasize+2);
+            memset(data,'x',config.datasize);
+            for (i = 0; i < 10; i++) {
+                c->obuf = sdscatprintf(c->obuf,"$%d\r\n%s\r\n",config.datasize,data);
+            }
+            zfree(data);
+        }
+        createMissingClients(c);
+        aeMain(config.el);
+        endBenchmark();
+
+        prepareForBenchmark("SET");
+        c = createClient(REDIS_REPLY_STATUS);
+        c->obuf = sdscat(c->obuf,"*3\r\n$3\r\nSET\r\n$20\r\nfoo_rand000000000000\r\n");
         {
             char *data = zmalloc(config.datasize+2);
             memset(data,'x',config.datasize);
             data[config.datasize] = '\r';
             data[config.datasize+1] = '\n';
+            c->obuf = sdscatprintf(c->obuf,"$%d\r\n",config.datasize);
             c->obuf = sdscatlen(c->obuf,data,config.datasize+2);
         }
-        prepareClientForReply(c,REPLY_RETCODE);
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("SET");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
+        prepareForBenchmark("GET");
+        c = createClient(REDIS_REPLY_STRING);
         c->obuf = sdscat(c->obuf,"GET foo_rand000000000000\r\n");
-        prepareClientForReply(c,REPLY_BULK);
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("GET");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
+        prepareForBenchmark("INCR");
+        c = createClient(REDIS_REPLY_INTEGER);
         c->obuf = sdscat(c->obuf,"INCR counter_rand000000000000\r\n");
-        prepareClientForReply(c,REPLY_INT);
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("INCR");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
-        c->obuf = sdscat(c->obuf,"LPUSH mylist 3\r\nbar\r\n");
-        prepareClientForReply(c,REPLY_INT);
+        prepareForBenchmark("LPUSH");
+        c = createClient(REDIS_REPLY_INTEGER);
+        c->obuf = sdscat(c->obuf,"LPUSH mylist bar\r\n");
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("LPUSH");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
+        prepareForBenchmark("LPOP");
+        c = createClient(REDIS_REPLY_STRING);
         c->obuf = sdscat(c->obuf,"LPOP mylist\r\n");
-        prepareClientForReply(c,REPLY_BULK);
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("LPOP");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
-        c->obuf = sdscat(c->obuf,"SADD myset 24\r\ncounter_rand000000000000\r\n");
-        prepareClientForReply(c,REPLY_RETCODE);
+        prepareForBenchmark("SADD");
+        c = createClient(REDIS_REPLY_STATUS);
+        c->obuf = sdscat(c->obuf,"SADD myset counter_rand000000000000\r\n");
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("SADD");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
+        prepareForBenchmark("SPOP");
+        c = createClient(REDIS_REPLY_STRING);
         c->obuf = sdscat(c->obuf,"SPOP myset\r\n");
-        prepareClientForReply(c,REPLY_BULK);
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("SPOP");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
-        c->obuf = sdscat(c->obuf,"LPUSH mylist 3\r\nbar\r\n");
-        prepareClientForReply(c,REPLY_RETCODE);
+        prepareForBenchmark("LPUSH (again, in order to bench LRANGE)");
+        c = createClient(REDIS_REPLY_STATUS);
+        c->obuf = sdscat(c->obuf,"LPUSH mylist bar\r\n");
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("LPUSH (again, in order to bench LRANGE)");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
+        prepareForBenchmark("LRANGE (first 100 elements)");
+        c = createClient(REDIS_REPLY_ARRAY);
         c->obuf = sdscat(c->obuf,"LRANGE mylist 0 99\r\n");
-        prepareClientForReply(c,REPLY_MBULK);
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("LRANGE (first 100 elements)");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
+        prepareForBenchmark("LRANGE (first 300 elements)");
+        c = createClient(REDIS_REPLY_ARRAY);
         c->obuf = sdscat(c->obuf,"LRANGE mylist 0 299\r\n");
-        prepareClientForReply(c,REPLY_MBULK);
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("LRANGE (first 300 elements)");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
+        prepareForBenchmark("LRANGE (first 450 elements)");
+        c = createClient(REDIS_REPLY_ARRAY);
         c->obuf = sdscat(c->obuf,"LRANGE mylist 0 449\r\n");
-        prepareClientForReply(c,REPLY_MBULK);
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("LRANGE (first 450 elements)");
+        endBenchmark();
 
-        prepareForBenchmark();
-        c = createClient();
-        if (!c) exit(1);
+        prepareForBenchmark("LRANGE (first 600 elements)");
+        c = createClient(REDIS_REPLY_ARRAY);
         c->obuf = sdscat(c->obuf,"LRANGE mylist 0 599\r\n");
-        prepareClientForReply(c,REPLY_MBULK);
         createMissingClients(c);
         aeMain(config.el);
-        endBenchmark("LRANGE (first 600 elements)");
+        endBenchmark();
 
         printf("\n");
     } while(config.loop);

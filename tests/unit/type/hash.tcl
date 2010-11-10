@@ -15,8 +15,8 @@ start_server {tags {"hash"}} {
     } {8}
 
     test {Is the small hash encoded with a zipmap?} {
-        r debug object smallhash
-    } {*zipmap*}
+        assert_encoding zipmap smallhash
+    }
 
     test {HSET/HLEN - Big hash creation} {
         array set bighash {}
@@ -34,8 +34,8 @@ start_server {tags {"hash"}} {
     } {1024}
 
     test {Is the big hash encoded with a zipmap?} {
-        r debug object bighash
-    } {*hashtable*}
+        assert_encoding hashtable bighash
+    }
 
     test {HGET against the small hash} {
         set err {}
@@ -139,6 +139,11 @@ start_server {tags {"hash"}} {
         lappend rv [r hmget bighash __123123123__ __456456456__]
         set _ $rv
     } {{{} {}} {{} {}} {{} {}}}
+
+    test {HMGET against wrong type} {
+        r set wrongtype somevalue
+        assert_error "*wrong*" {r hmget wrongtype field1 field2}
+    }
 
     test {HMGET - small hash} {
         set keys {}

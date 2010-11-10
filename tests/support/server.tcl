@@ -83,7 +83,9 @@ proc ping_server {host port} {
         }
         close $fd
     } e]} {
-        puts "Can't PING server at $host:$port... $e"
+        puts -nonewline "."
+    } else {
+        puts -nonewline "ok"
     }
     return $retval
 }
@@ -170,14 +172,33 @@ proc start_server {options {code undefined}} {
 
     if {$::valgrind} {
         exec valgrind src/redis-server $config_file > $stdout 2> $stderr &
-        after 2000
     } else {
         exec src/redis-server $config_file > $stdout 2> $stderr &
-        after 500
     }
     
     # check that the server actually started
-    if {$code ne "undefined" && ![ping_server $::host $::port]} {
+    # ugly but tries to be as fast as possible...
+    set retrynum 20
+    set serverisup 0
+
+    puts -nonewline "=== ($tags) Starting server ${::host}:${::port} "
+    after 10
+    if {$code ne "undefined"} {
+        while {[incr retrynum -1]} {
+            catch {
+                if {[ping_server $::host $::port]} {
+                    set serverisup 1
+                }
+            }
+            if {$serverisup} break
+            after 50
+        }
+    } else {
+        set serverisup 1
+    }
+    puts {}
+
+    if {!$serverisup} {
         error_and_quit $config_file [exec cat $stderr]
     }
     
@@ -194,7 +215,8 @@ proc start_server {options {code undefined}} {
     if {[dict exists $config port]} { set port [dict get $config port] }
 
     # setup config dict
-    dict set srv "config" $config_file
+    dict set srv "config_file" $config_file
+    dict set srv "config" $config
     dict set srv "pid" $pid
     dict set srv "host" $host
     dict set srv "port" $port
@@ -217,17 +239,12 @@ proc start_server {options {code undefined}} {
             after 10
         }
 
-        set client [redis $host $port]
-        dict set srv "client" $client
-
-        # select the right db when we don't have to authenticate
-        if {![dict exists $config requirepass]} {
-            $client select 9
-        }
-
         # append the server to the stack
         lappend ::servers $srv
-        
+
+        # connect client (after server dict is put on the stack)
+        reconnect
+
         # execute provided block
         set curnum $::testnum
         if {![catch { uplevel 1 $code } err]} {

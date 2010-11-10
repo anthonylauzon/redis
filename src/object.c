@@ -3,30 +3,25 @@
 #include <math.h>
 
 robj *createObject(int type, void *ptr) {
-    robj *o;
-
-    if (server.vm_enabled) pthread_mutex_lock(&server.obj_freelist_mutex);
-    if (listLength(server.objfreelist)) {
-        listNode *head = listFirst(server.objfreelist);
-        o = listNodeValue(head);
-        listDelNode(server.objfreelist,head);
-        if (server.vm_enabled) pthread_mutex_unlock(&server.obj_freelist_mutex);
-    } else {
-        if (server.vm_enabled) pthread_mutex_unlock(&server.obj_freelist_mutex);
-        o = zmalloc(sizeof(*o));
-    }
+    robj *o = zmalloc(sizeof(*o));
     o->type = type;
     o->encoding = REDIS_ENCODING_RAW;
     o->ptr = ptr;
     o->refcount = 1;
-    if (server.vm_enabled) {
-        /* Note that this code may run in the context of an I/O thread
-         * and accessing server.lruclock in theory is an error
-         * (no locks). But in practice this is safe, and even if we read
-         * garbage Redis will not fail. */
-        o->lru = server.lruclock;
-        o->storage = REDIS_VM_MEMORY;
-    }
+
+    /* Set the LRU to the current lruclock (minutes resolution).
+     * We do this regardless of the fact VM is active as LRU is also
+     * used for the maxmemory directive when Redis is used as cache.
+     *
+     * Note that this code may run in the context of an I/O thread
+     * and accessing server.lruclock in theory is an error
+     * (no locks). But in practice this is safe, and even if we read
+     * garbage Redis will not fail. */
+    o->lru = server.lruclock;
+    /* The following is only needed if VM is active, but since the conditional
+     * is probably more costly than initializing the field it's better to
+     * have every field properly initialized anyway. */
+    o->storage = REDIS_VM_MEMORY;
     return o;
 }
 
@@ -199,11 +194,7 @@ void decrRefCount(void *obj) {
         default: redisPanic("Unknown object type"); break;
         }
         o->ptr = NULL; /* defensive programming. We'll see NULL in traces. */
-        if (server.vm_enabled) pthread_mutex_lock(&server.obj_freelist_mutex);
-        if (listLength(server.objfreelist) > REDIS_OBJFREELIST_MAX ||
-            !listAddNodeHead(server.objfreelist,o))
-            zfree(o);
-        if (server.vm_enabled) pthread_mutex_unlock(&server.obj_freelist_mutex);
+        zfree(o);
     }
 }
 
@@ -240,8 +231,12 @@ robj *tryObjectEncoding(robj *o) {
      * range and if this is the main thread, since when VM is enabled we
      * have the constraint that I/O thread should only handle non-shared
      * objects, in order to avoid race conditions (we don't have per-object
-     * locking). */
-    if (value >= 0 && value < REDIS_SHARED_INTEGERS &&
+     * locking).
+     *
+     * Note that we also avoid using shared integers when maxmemory is used
+     * because very object needs to have a private LRU field for the LRU
+     * algorithm to work well. */
+    if (server.maxmemory == 0 && value >= 0 && value < REDIS_SHARED_INTEGERS &&
         pthread_equal(pthread_self(),server.mainthread)) {
         decrRefCount(o);
         incrRefCount(shared.integers[value]);
@@ -354,9 +349,9 @@ int getDoubleFromObjectOrReply(redisClient *c, robj *o, double *target, const ch
     double value;
     if (getDoubleFromObject(o, &value) != REDIS_OK) {
         if (msg != NULL) {
-            addReplySds(c, sdscatprintf(sdsempty(), "-ERR %s\r\n", msg));
+            addReplyError(c,(char*)msg);
         } else {
-            addReplySds(c, sdsnew("-ERR value is not a double\r\n"));
+            addReplyError(c,"value is not a double");
         }
         return REDIS_ERR;
     }
@@ -393,9 +388,9 @@ int getLongLongFromObjectOrReply(redisClient *c, robj *o, long long *target, con
     long long value;
     if (getLongLongFromObject(o, &value) != REDIS_OK) {
         if (msg != NULL) {
-            addReplySds(c, sdscatprintf(sdsempty(), "-ERR %s\r\n", msg));
+            addReplyError(c,(char*)msg);
         } else {
-            addReplySds(c, sdsnew("-ERR value is not an integer or out of range\r\n"));
+            addReplyError(c,"value is not an integer or out of range");
         }
         return REDIS_ERR;
     }
@@ -410,9 +405,9 @@ int getLongFromObjectOrReply(redisClient *c, robj *o, long *target, const char *
     if (getLongLongFromObjectOrReply(c, o, &value, msg) != REDIS_OK) return REDIS_ERR;
     if (value < LONG_MIN || value > LONG_MAX) {
         if (msg != NULL) {
-            addReplySds(c, sdscatprintf(sdsempty(), "-ERR %s\r\n", msg));
+            addReplyError(c,(char*)msg);
         } else {
-            addReplySds(c, sdsnew("-ERR value is out of range\r\n"));
+            addReplyError(c,"value is out of range");
         }
         return REDIS_ERR;
     }
@@ -431,5 +426,16 @@ char *strEncoding(int encoding) {
     case REDIS_ENCODING_ZIPLIST: return "ziplist";
     case REDIS_ENCODING_INTSET: return "intset";
     default: return "unknown";
+    }
+}
+
+/* Given an object returns the min number of seconds the object was never
+ * requested, using an approximated LRU algorithm. */
+unsigned long estimateObjectIdleTime(robj *o) {
+    if (server.lruclock >= o->lru) {
+        return (server.lruclock - o->lru) * REDIS_LRU_CLOCK_RESOLUTION;
+    } else {
+        return ((REDIS_LRU_CLOCK_MAX - o->lru) + server.lruclock) *
+                    REDIS_LRU_CLOCK_RESOLUTION;
     }
 }

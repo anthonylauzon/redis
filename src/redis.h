@@ -43,12 +43,12 @@
 #define REDIS_STATIC_ARGS       8
 #define REDIS_DEFAULT_DBNUM     16
 #define REDIS_CONFIGLINE_MAX    1024
-#define REDIS_OBJFREELIST_MAX   1000000 /* Max number of objects to cache */
 #define REDIS_MAX_SYNC_TIME     60      /* Slave can't take more to sync */
 #define REDIS_EXPIRELOOKUPS_PER_CRON    10 /* lookup 10 expires per loop */
 #define REDIS_MAX_WRITE_PER_EVENT (1024*64)
 #define REDIS_REQUEST_MAX_SIZE (1024*1024*256) /* max bytes in inline command */
 #define REDIS_SHARED_INTEGERS 10000
+#define REDIS_REPLY_CHUNK_BYTES (5*1500) /* 5 TCP packets with default MTU */
 
 /* If more then REDIS_WRITEV_THRESHOLD write packets are pending use writev */
 #define REDIS_WRITEV_THRESHOLD      3
@@ -58,15 +58,15 @@
 /* Hash table parameters */
 #define REDIS_HT_MINFILL        10      /* Minimal hash table fill 10% */
 
-/* Command flags */
-#define REDIS_CMD_BULK          1       /* Bulk write command */
-#define REDIS_CMD_INLINE        2       /* Inline command */
-/* REDIS_CMD_DENYOOM reserves a longer comment: all the commands marked with
-   this flags will return an error when the 'maxmemory' option is set in the
-   config file and the server is using more than maxmemory bytes of memory.
-   In short this commands are denied on low memory conditions. */
-#define REDIS_CMD_DENYOOM       4
-#define REDIS_CMD_FORCE_REPLICATION 8 /* Force replication even if dirty is 0 */
+/* Command flags:
+ *   REDIS_CMD_DENYOOM:
+ *     Commands marked with this flag will return an error when 'maxmemory' is
+ *     set and the server is using more than 'maxmemory' bytes of memory.
+ *     In short: commands with this flag are denied on low memory conditions.
+ *   REDIS_CMD_FORCE_REPLICATION:
+ *     Force replication even if dirty is 0. */
+#define REDIS_CMD_DENYOOM 4
+#define REDIS_CMD_FORCE_REPLICATION 8
 
 /* Object types */
 #define REDIS_STRING 0
@@ -145,11 +145,17 @@
 #define REDIS_BLOCKED 16    /* The client is waiting in a blocking operation */
 #define REDIS_IO_WAIT 32    /* The client is waiting for Virtual Memory I/O */
 #define REDIS_DIRTY_CAS 64  /* Watched keys modified. EXEC will fail. */
+#define REDIS_CLOSE_AFTER_REPLY 128 /* Close after writing entire reply. */
+
+/* Client request types */
+#define REDIS_REQ_INLINE 1
+#define REDIS_REQ_MULTIBULK 2
 
 /* Slave replication state - slave side */
 #define REDIS_REPL_NONE 0   /* No active replication */
 #define REDIS_REPL_CONNECT 1    /* Must connect to master */
-#define REDIS_REPL_CONNECTED 2  /* Connected to master */
+#define REDIS_REPL_TRANSFER 2    /* Receiving .rdb from master */
+#define REDIS_REPL_CONNECTED 3  /* Connected to master */
 
 /* Slave replication state - from the point of view of master
  * Note that in SEND_BULK and ONLINE state the slave receives new updates
@@ -199,8 +205,18 @@
 #define REDIS_OP_DIFF 1
 #define REDIS_OP_INTER 2
 
+
 /* Number of keys to remove when freeing memory */
 #define REDIS_NUM_DELETE_FREEING 100
+
+/* Redis maxmemory strategies */
+#define REDIS_MAXMEMORY_VOLATILE_LRU 0
+#define REDIS_MAXMEMORY_VOLATILE_TTL 1
+#define REDIS_MAXMEMORY_VOLATILE_RANDOM 2
+#define REDIS_MAXMEMORY_ALLKEYS_LRU 3
+#define REDIS_MAXMEMORY_ALLKEYS_RANDOM 4
+#define REDIS_MAXMEMORY_NO_EVICTION 5
+
 
 /* We can print the stacktrace, so our assert is defined this way: */
 #define redisAssert(_e) ((_e)?(void)0 : (_redisAssert(#_e,__FILE__,__LINE__),_exit(1)))
@@ -215,6 +231,8 @@ void _redisPanic(char *msg, char *file, int line);
 /* A redis object, that is a type able to hold a string / list / set */
 
 /* The actual Redis Object */
+#define REDIS_LRU_CLOCK_MAX ((1<<21)-1) /* Max value of obj->lru */
+#define REDIS_LRU_CLOCK_RESOLUTION 10 /* LRU clock resolution in seconds */
 typedef struct redisObject {
     unsigned type:4;
     unsigned storage:2;     /* REDIS_VM_MEMORY or REDIS_VM_SWAPPING */
@@ -289,10 +307,11 @@ typedef struct redisClient {
     redisDb *db;
     int dictid;
     sds querybuf;
-    robj **argv, **mbargv;
-    int argc, mbargc;
-    long bulklen;            /* bulk read len. -1 if not in bulk read mode */
-    int multibulk;          /* multi bulk command format active */
+    int argc;
+    robj **argv;
+    int reqtype;
+    int multibulklen;       /* number of multi bulk arguments left to read */
+    long bulklen;           /* length of bulk argument in multi bulk request */
     list *reply;
     int sentlen;
     time_t lastinteraction; /* time of the last interaction, used for timeout */
@@ -314,6 +333,10 @@ typedef struct redisClient {
     list *watched_keys;     /* Keys WATCHED for MULTI/EXEC CAS */
     dict *pubsub_channels;  /* channels a client is interested in (SUBSCRIBE) */
     list *pubsub_patterns;  /* patterns a client is interested in (SUBSCRIBE) */
+
+    /* Response buffer */
+    int bufpos;
+    char buf[REDIS_REPLY_CHUNK_BYTES];
 } redisClient;
 
 struct saveparam {
@@ -325,7 +348,7 @@ struct sharedObjectsStruct {
     robj *crlf, *ok, *err, *emptybulk, *czero, *cone, *cnegone, *pong, *space,
     *colon, *nullbulk, *nullmultibulk, *queued,
     *emptymultibulk, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr,
-    *outofrangeerr, *plus,
+    *outofrangeerr, *loadingerr, *plus,
     *select0, *select1, *select2, *select3, *select4,
     *select5, *select6, *select7, *select8, *select9,
     *messagebulk, *pmessagebulk, *subscribebulk, *unsubscribebulk, *mbulk3,
@@ -337,22 +360,36 @@ struct sharedObjectsStruct {
 struct redisServer {
     pthread_t mainthread;
     int port;
-    int fd;
+    char *bindaddr;
+    char *unixsocket;
+    int ipfd;
+    int sofd;
     redisDb *db;
     FILE *dbsavelockfp;
+    int bgsaveneeded;
     long long dirty;            /* changes to DB from the last save */
+    long long dirty_before_bgsave; /* used to restore dirty on failed BGSAVE */
     list *clients;
+    dict *commands;             /* Command table hahs table */
+    /* RDB / AOF loading information */
+    int loading;
+    off_t loading_total_bytes;
+    off_t loading_loaded_bytes;
+    time_t loading_start_time;
+    /* Fast pointers to often looked up command */
+    struct redisCommand *delCommand, *multiCommand;
     list *slaves, *monitors;
     char neterr[ANET_ERR_LEN];
     aeEventLoop *el;
     int cronloops;              /* number of times the cron function run */
-    list *objfreelist;          /* A list of freed objects to avoid malloc() */
-    time_t lastsave;            /* Unix time of last save succeeede */
+    time_t lastsave;                /* Unix time of last save succeeede */
     /* Fields used only for stats */
-    time_t stat_starttime;         /* server start time */
-    long long stat_numcommands;    /* number of processed commands */
-    long long stat_numconnections; /* number of connections received */
-    long long stat_expiredkeys;   /* number of expired keys */
+    time_t stat_starttime;          /* server start time */
+    long long stat_numcommands;     /* number of processed commands */
+    long long stat_numconnections;  /* number of connections received */
+    long long stat_expiredkeys;     /* number of expired keys */
+    long long stat_keyspace_hits;   /* number of successful lookups of keys */
+    long long stat_keyspace_misses; /* number of failed lookups of keys */
     /* Configuration */
     int verbosity;
     int glueoutputbuf;
@@ -374,7 +411,6 @@ struct redisServer {
     struct saveparam *saveparams;
     int saveparamslen;
     char *logfile;
-    char *bindaddr;
     char *dbfilename;
     char *appendfilename;
     char *requirepass;
@@ -382,13 +418,24 @@ struct redisServer {
     int activerehashing;
     /* Replication related */
     int isslave;
+    /* Slave specific fields */
     char *masterauth;
     char *masterhost;
     int masterport;
     redisClient *master;    /* client that is master for this slave */
-    int replstate;
+    int replstate;          /* replication status if the instance is a slave */
+    off_t repl_transfer_left;  /* bytes left reading .rdb  */
+    int repl_transfer_s;    /* slave -> master SYNC socket */
+    int repl_transfer_fd;   /* slave -> master SYNC temp file descriptor */
+    char *repl_transfer_tmpfile; /* slave-> master SYNC temp file name */
+    time_t repl_transfer_lastio; /* unix time of the latest read, for timeout */
+    int repl_serve_stale_data; /* Serve stale data when link is down? */
+    /* Limits */
     unsigned int maxclients;
     unsigned long long maxmemory;
+    int maxmemory_policy;
+    int maxmemory_samples;
+    /* Blocked clients */
     unsigned int blpop_blocked_clients;
     unsigned int vm_blocked_clients;
     /* Sort parameters - qsort_r() is only available under BSD so we
@@ -424,7 +471,6 @@ struct redisServer {
     list *io_processed; /* List of VM I/O jobs already processed */
     list *io_ready_clients; /* Clients ready to be unblocked. All keys loaded */
     pthread_mutex_t io_mutex; /* lock to access io_jobs/io_done/io_thread_job */
-    pthread_mutex_t obj_freelist_mutex; /* safe redis objects creation/free */
     pthread_mutex_t io_swapfile_mutex; /* So we can lseek + write */
     pthread_attr_t io_threads_attr; /* attributes for threads creation */
     int io_active_threads; /* Number of running I/O threads */
@@ -490,13 +536,14 @@ typedef struct _redisSortOperation {
 } redisSortOperation;
 
 /* ZSETs use a specialized version of Skiplists */
-
 typedef struct zskiplistNode {
-    struct zskiplistNode **forward;
-    struct zskiplistNode *backward;
-    unsigned int *span;
-    double score;
     robj *obj;
+    double score;
+    struct zskiplistNode *backward;
+    struct zskiplistLevel {
+        struct zskiplistNode *forward;
+        unsigned int span;
+    } level[];
 } zskiplistNode;
 
 typedef struct zskiplist {
@@ -593,19 +640,34 @@ void resetClient(redisClient *c);
 void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask);
 void sendReplyToClientWritev(aeEventLoop *el, int fd, void *privdata, int mask);
 void addReply(redisClient *c, robj *obj);
+void *addDeferredMultiBulkLength(redisClient *c);
+void setDeferredMultiBulkLength(redisClient *c, void *node, long length);
 void addReplySds(redisClient *c, sds s);
 void processInputBuffer(redisClient *c);
-void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask);
 void addReplyBulk(redisClient *c, robj *obj);
 void addReplyBulkCString(redisClient *c, char *s);
 void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void addReply(redisClient *c, robj *obj);
 void addReplySds(redisClient *c, sds s);
+void addReplyError(redisClient *c, char *err);
+void addReplyStatus(redisClient *c, char *status);
 void addReplyDouble(redisClient *c, double d);
 void addReplyLongLong(redisClient *c, long long ll);
-void addReplyUlong(redisClient *c, unsigned long ul);
+void addReplyMultiBulkLen(redisClient *c, long length);
 void *dupClientReplyValue(void *o);
+
+#ifdef __GNUC__
+void addReplyErrorFormat(redisClient *c, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+void addReplyStatusFormat(redisClient *c, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+#else
+void addReplyErrorFormat(redisClient *c, const char *fmt, ...);
+void addReplyStatusFormat(redisClient *c, const char *fmt, ...);
+#endif
 
 /* List data type */
 void listTypeTryConversion(robj *subject, robj *value);
@@ -646,7 +708,6 @@ robj *dupStringObject(robj *o);
 robj *tryObjectEncoding(robj *o);
 robj *getDecodedObject(robj *o);
 size_t stringObjectLen(robj *o);
-int tryFreeOneObjectFromFreelist(void);
 robj *createStringObjectFromLongLong(long long value);
 robj *createListObject(void);
 robj *createZiplistObject(void);
@@ -662,15 +723,33 @@ int getLongLongFromObject(robj *o, long long *target);
 char *strEncoding(int encoding);
 int compareStringObjects(robj *a, robj *b);
 int equalStringObjects(robj *a, robj *b);
+unsigned long estimateObjectIdleTime(robj *o);
+
+/* Synchronous I/O with timeout */
+int syncWrite(int fd, char *ptr, ssize_t size, int timeout);
+int syncRead(int fd, char *ptr, ssize_t size, int timeout);
+int syncReadLine(int fd, char *ptr, ssize_t size, int timeout);
+int fwriteBulkString(FILE *fp, char *s, unsigned long len);
+int fwriteBulkDouble(FILE *fp, double d);
+int fwriteBulkLongLong(FILE *fp, long long l);
+int fwriteBulkObject(FILE *fp, robj *obj);
 
 /* Replication */
 void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc);
 void replicationFeedMonitors(list *monitors, int dictid, robj **argv, int argc);
 int syncWithMaster(void);
 void updateSlavesWaitingBgsave(int bgsaveerr);
+
 void syncmasterCommand(redisClient *c);
 void registerslaveCommand(redisClient *c);
 int registerWithMaster(void);
+
+void replicationCron(void);
+
+/* Generic persistence functions */
+void startLoading(FILE *fp);
+void loadingProgress(off_t pos);
+void stopLoading(void);
 
 
 /* RDB persistence */
@@ -697,13 +776,14 @@ void backgroundRewriteDoneHandler(int statloc);
 /* Sorted sets data type */
 zskiplist *zslCreate(void);
 void zslFree(zskiplist *zsl);
-void zslInsert(zskiplist *zsl, double score, robj *obj);
+zskiplistNode *zslInsert(zskiplist *zsl, double score, robj *obj);
 
 /* Core functions */
 void freeMemoryIfNeeded(void);
 int processCommand(redisClient *c);
 void setupSigSegvAction(void);
-struct redisCommand *lookupCommand(char *name);
+struct redisCommand *lookupCommand(sds name);
+struct redisCommand *lookupCommandByCString(char *s);
 void call(redisClient *c, struct redisCommand *cmd);
 int prepareForShutdown();
 void redisLog(int level, const char *fmt, ...);
@@ -711,6 +791,7 @@ void usage();
 void updateDictResizePolicy(void);
 int htNeedsResize(dict *dict);
 void oom(const char *msg);
+void populateCommandTable(void);
 
 /* Virtual Memory */
 void vmInit(void);
@@ -884,6 +965,7 @@ void zaddCommand(redisClient *c);
 void zincrbyCommand(redisClient *c);
 void zrangeCommand(redisClient *c);
 void zrangebyscoreCommand(redisClient *c);
+void zrevrangebyscoreCommand(redisClient *c);
 void zcountCommand(redisClient *c);
 void zrevrangeCommand(redisClient *c);
 void zcardCommand(redisClient *c);

@@ -5,8 +5,17 @@
 #include <AvailabilityMacros.h>
 #endif
 
-/* test for malloc_size() */
-#ifdef __APPLE__
+/* Use tcmalloc's malloc_size() when available.
+ * When tcmalloc is used, native OSX malloc_size() may never be used because
+ * this expects a different allocation scheme. Therefore, *exclusively* use
+ * either tcmalloc or OSX's malloc_size()! */
+#if defined(USE_TCMALLOC)
+#include <google/tcmalloc.h>
+#if TC_VERSION_MAJOR >= 1 && TC_VERSION_MINOR >= 6
+#define HAVE_MALLOC_SIZE 1
+#define redis_malloc_size(p) tc_malloc_size(p)
+#endif
+#elif defined(__APPLE__)
 #include <malloc/malloc.h>
 #define HAVE_MALLOC_SIZE 1
 #define redis_malloc_size(p) malloc_size(p)
@@ -19,6 +28,16 @@
 #else
 #define redis_fstat fstat
 #define redis_stat stat
+#endif
+
+/* test for proc filesystem */
+#ifdef __linux__
+#define HAVE_PROCFS 1
+#endif
+
+/* test for task_info() */
+#if defined(__APPLE__)
+#define HAVE_TASKINFO 1
 #endif
 
 /* test for backtrace() */

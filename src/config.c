@@ -55,7 +55,7 @@ void loadServerConfig(char *filename) {
         }
 
         /* Split into arguments */
-        argv = sdssplitlen(line,sdslen(line)," ",1,&argc);
+        argv = sdssplitargs(line,&argc);
         sdstolower(argv[0]);
 
         /* Execute config directives */
@@ -71,6 +71,8 @@ void loadServerConfig(char *filename) {
             }
         } else if (!strcasecmp(argv[0],"bind") && argc == 2) {
             server.bindaddr = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"unixsocket") && argc == 2) {
+            server.unixsocket = zstrdup(argv[1]);
         } else if (!strcasecmp(argv[0],"save") && argc == 3) {
             int seconds = atoi(argv[1]);
             int changes = atoi(argv[2]);
@@ -123,12 +125,39 @@ void loadServerConfig(char *filename) {
             server.maxclients = atoi(argv[1]);
         } else if (!strcasecmp(argv[0],"maxmemory") && argc == 2) {
             server.maxmemory = memtoll(argv[1],NULL);
+        } else if (!strcasecmp(argv[0],"maxmemory-policy") && argc == 2) {
+            if (!strcasecmp(argv[1],"volatile-lru")) {
+                server.maxmemory_policy = REDIS_MAXMEMORY_VOLATILE_LRU;
+            } else if (!strcasecmp(argv[1],"volatile-random")) {
+                server.maxmemory_policy = REDIS_MAXMEMORY_VOLATILE_RANDOM;
+            } else if (!strcasecmp(argv[1],"volatile-ttl")) {
+                server.maxmemory_policy = REDIS_MAXMEMORY_VOLATILE_TTL;
+            } else if (!strcasecmp(argv[1],"allkeys-lru")) {
+                server.maxmemory_policy = REDIS_MAXMEMORY_ALLKEYS_LRU;
+            } else if (!strcasecmp(argv[1],"allkeys-random")) {
+                server.maxmemory_policy = REDIS_MAXMEMORY_ALLKEYS_RANDOM;
+            } else if (!strcasecmp(argv[1],"noeviction")) {
+                server.maxmemory_policy = REDIS_MAXMEMORY_NO_EVICTION;
+            } else {
+                err = "Invalid maxmemory policy";
+                goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"maxmemory-samples") && argc == 2) {
+            server.maxmemory_samples = atoi(argv[1]);
+            if (server.maxmemory_samples <= 0) {
+                err = "maxmemory-samples must be 1 or greater";
+                goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"slaveof") && argc == 3) {
             server.masterhost = sdsnew(argv[1]);
             server.masterport = atoi(argv[2]);
             server.replstate = REDIS_REPL_CONNECT;
         } else if (!strcasecmp(argv[0],"masterauth") && argc == 2) {
         	server.masterauth = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"slave-serve-stale-data") && argc == 2) {
+            if ((server.repl_serve_stale_data = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"glueoutputbuf") && argc == 2) {
             if ((server.glueoutputbuf = yesnotoi(argv[1])) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
@@ -191,16 +220,40 @@ void loadServerConfig(char *filename) {
             server.vm_pages = memtoll(argv[1], NULL);
         } else if (!strcasecmp(argv[0],"vm-max-threads") && argc == 2) {
             server.vm_max_threads = strtoll(argv[1], NULL, 10);
-        } else if (!strcasecmp(argv[0],"hash-max-zipmap-entries") && argc == 2){
+        } else if (!strcasecmp(argv[0],"hash-max-zipmap-entries") && argc == 2) {
             server.hash_max_zipmap_entries = memtoll(argv[1], NULL);
-        } else if (!strcasecmp(argv[0],"hash-max-zipmap-value") && argc == 2){
+        } else if (!strcasecmp(argv[0],"hash-max-zipmap-value") && argc == 2) {
             server.hash_max_zipmap_value = memtoll(argv[1], NULL);
         } else if (!strcasecmp(argv[0],"list-max-ziplist-entries") && argc == 2){
             server.list_max_ziplist_entries = memtoll(argv[1], NULL);
-        } else if (!strcasecmp(argv[0],"list-max-ziplist-value") && argc == 2){
+        } else if (!strcasecmp(argv[0],"list-max-ziplist-value") && argc == 2) {
             server.list_max_ziplist_value = memtoll(argv[1], NULL);
-        } else if (!strcasecmp(argv[0],"set-max-intset-entries") && argc == 2){
+        } else if (!strcasecmp(argv[0],"set-max-intset-entries") && argc == 2) {
             server.set_max_intset_entries = memtoll(argv[1], NULL);
+        } else if (!strcasecmp(argv[0],"rename-command") && argc == 3) {
+            struct redisCommand *cmd = lookupCommand(argv[1]);
+            int retval;
+
+            if (!cmd) {
+                err = "No such command in rename-command";
+                goto loaderr;
+            }
+
+            /* If the target command name is the emtpy string we just
+             * remove it from the command table. */
+            retval = dictDelete(server.commands, argv[1]);
+            redisAssert(retval == DICT_OK);
+
+            /* Otherwise we re-add the command under a different name. */
+            if (sdslen(argv[2]) != 0) {
+                sds copy = sdsdup(argv[2]);
+
+                retval = dictAdd(server.commands, copy, cmd);
+                if (retval != DICT_OK) {
+                    sdsfree(copy);
+                    err = "Target command name already exists"; goto loaderr;
+                }
+            }
         } else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }
@@ -225,8 +278,11 @@ loaderr:
  *----------------------------------------------------------------------------*/
 
 void configSetCommand(redisClient *c) {
-    robj *o = getDecodedObject(c->argv[3]);
+    robj *o;
     long long ll;
+    redisAssert(c->argv[2]->encoding == REDIS_ENCODING_RAW);
+    redisAssert(c->argv[3]->encoding == REDIS_ENCODING_RAW);
+    o = c->argv[3];
 
     if (!strcasecmp(c->argv[2]->ptr,"dbfilename")) {
         zfree(server.dbfilename);
@@ -241,6 +297,27 @@ void configSetCommand(redisClient *c) {
         if (getLongLongFromObject(o,&ll) == REDIS_ERR ||
             ll < 0) goto badfmt;
         server.maxmemory = ll;
+        if (server.maxmemory) freeMemoryIfNeeded();
+    } else if (!strcasecmp(c->argv[2]->ptr,"maxmemory-policy")) {
+        if (!strcasecmp(o->ptr,"volatile-lru")) {
+            server.maxmemory_policy = REDIS_MAXMEMORY_VOLATILE_LRU;
+        } else if (!strcasecmp(o->ptr,"volatile-random")) {
+            server.maxmemory_policy = REDIS_MAXMEMORY_VOLATILE_RANDOM;
+        } else if (!strcasecmp(o->ptr,"volatile-ttl")) {
+            server.maxmemory_policy = REDIS_MAXMEMORY_VOLATILE_TTL;
+        } else if (!strcasecmp(o->ptr,"allkeys-lru")) {
+            server.maxmemory_policy = REDIS_MAXMEMORY_ALLKEYS_LRU;
+        } else if (!strcasecmp(o->ptr,"allkeys-random")) {
+            server.maxmemory_policy = REDIS_MAXMEMORY_ALLKEYS_RANDOM;
+        } else if (!strcasecmp(o->ptr,"noeviction")) {
+            server.maxmemory_policy = REDIS_MAXMEMORY_NO_EVICTION;
+        } else {
+            goto badfmt;
+        }
+    } else if (!strcasecmp(c->argv[2]->ptr,"maxmemory-samples")) {
+        if (getLongLongFromObject(o,&ll) == REDIS_ERR ||
+            ll <= 0) goto badfmt;
+        server.maxmemory_samples = ll;
     } else if (!strcasecmp(c->argv[2]->ptr,"timeout")) {
         if (getLongLongFromObject(o,&ll) == REDIS_ERR ||
             ll < 0 || ll > LONG_MAX) goto badfmt;
@@ -270,9 +347,8 @@ void configSetCommand(redisClient *c) {
                 stopAppendOnly();
             } else {
                 if (startAppendOnly() == REDIS_ERR) {
-                    addReplySds(c,sdscatprintf(sdsempty(),
-                        "-ERR Unable to turn on AOF. Check server logs.\r\n"));
-                    decrRefCount(o);
+                    addReplyError(c,
+                        "Unable to turn on AOF. Check server logs.");
                     return;
                 }
             }
@@ -311,33 +387,32 @@ void configSetCommand(redisClient *c) {
             appendServerSaveParams(seconds, changes);
         }
         sdsfreesplitres(v,vlen);
+    } else if (!strcasecmp(c->argv[2]->ptr,"slave-serve-stale-data")) {
+        int yn = yesnotoi(o->ptr);
+
+        if (yn == -1) goto badfmt;
+        server.repl_serve_stale_data = yn;
     } else {
-        addReplySds(c,sdscatprintf(sdsempty(),
-            "-ERR not supported CONFIG parameter %s\r\n",
-            (char*)c->argv[2]->ptr));
-        decrRefCount(o);
+        addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
+            (char*)c->argv[2]->ptr);
         return;
     }
-    decrRefCount(o);
     addReply(c,shared.ok);
     return;
 
 badfmt: /* Bad format errors */
-    addReplySds(c,sdscatprintf(sdsempty(),
-        "-ERR invalid argument '%s' for CONFIG SET '%s'\r\n",
+    addReplyErrorFormat(c,"Invalid argument '%s' for CONFIG SET '%s'",
             (char*)o->ptr,
-            (char*)c->argv[2]->ptr));
-    decrRefCount(o);
+            (char*)c->argv[2]->ptr);
 }
 
 void configGetCommand(redisClient *c) {
-    robj *o = getDecodedObject(c->argv[2]);
-    robj *lenobj = createObject(REDIS_STRING,NULL);
+    robj *o = c->argv[2];
+    void *replylen = addDeferredMultiBulkLength(c);
     char *pattern = o->ptr;
+    char buf[128];
     int matches = 0;
-
-    addReply(c,lenobj);
-    decrRefCount(lenobj);
+    redisAssert(o->encoding == REDIS_ENCODING_RAW);
 
     if (stringmatch(pattern,"dbfilename",0)) {
         addReplyBulkCString(c,"dbfilename");
@@ -355,17 +430,35 @@ void configGetCommand(redisClient *c) {
         matches++;
     }
     if (stringmatch(pattern,"maxmemory",0)) {
-        char buf[128];
-
-        ll2string(buf,128,server.maxmemory);
+        ll2string(buf,sizeof(buf),server.maxmemory);
         addReplyBulkCString(c,"maxmemory");
         addReplyBulkCString(c,buf);
         matches++;
     }
-    if (stringmatch(pattern,"timeout",0)) {
-        char buf[128];
+    if (stringmatch(pattern,"maxmemory-policy",0)) {
+        char *s;
 
-        ll2string(buf,128,server.maxidletime);
+        switch(server.maxmemory_policy) {
+        case REDIS_MAXMEMORY_VOLATILE_LRU: s = "volatile-lru"; break;
+        case REDIS_MAXMEMORY_VOLATILE_TTL: s = "volatile-ttl"; break;
+        case REDIS_MAXMEMORY_VOLATILE_RANDOM: s = "volatile-random"; break;
+        case REDIS_MAXMEMORY_ALLKEYS_LRU: s = "allkeys-lru"; break;
+        case REDIS_MAXMEMORY_ALLKEYS_RANDOM: s = "allkeys-random"; break;
+        case REDIS_MAXMEMORY_NO_EVICTION: s = "noeviction"; break;
+        default: s = "unknown"; break; /* too harmless to panic */
+        }
+        addReplyBulkCString(c,"maxmemory-policy");
+        addReplyBulkCString(c,s);
+        matches++;
+    }
+    if (stringmatch(pattern,"maxmemory-samples",0)) {
+        ll2string(buf,sizeof(buf),server.maxmemory_samples);
+        addReplyBulkCString(c,"maxmemory-samples");
+        addReplyBulkCString(c,buf);
+        matches++;
+    }
+    if (stringmatch(pattern,"timeout",0)) {
+        ll2string(buf,sizeof(buf),server.maxidletime);
         addReplyBulkCString(c,"timeout");
         addReplyBulkCString(c,buf);
         matches++;
@@ -409,8 +502,12 @@ void configGetCommand(redisClient *c) {
         sdsfree(buf);
         matches++;
     }
-    decrRefCount(o);
-    lenobj->ptr = sdscatprintf(sdsempty(),"*%d\r\n",matches*2);
+    if (stringmatch(pattern,"slave-serve-stale-data",0)) {
+        addReplyBulkCString(c,"slave-serve-stale-data");
+        addReplyBulkCString(c,server.repl_serve_stale_data ? "yes" : "no");
+        matches++;
+    }
+    setDeferredMultiBulkLength(c,replylen,matches*2);
 }
 
 void configCommand(redisClient *c) {
@@ -422,19 +519,19 @@ void configCommand(redisClient *c) {
         configGetCommand(c);
     } else if (!strcasecmp(c->argv[1]->ptr,"resetstat")) {
         if (c->argc != 2) goto badarity;
+        server.stat_keyspace_hits = 0;
+        server.stat_keyspace_misses = 0;
         server.stat_numcommands = 0;
         server.stat_numconnections = 0;
         server.stat_expiredkeys = 0;
-        server.stat_starttime = time(NULL);
         addReply(c,shared.ok);
     } else {
-        addReplySds(c,sdscatprintf(sdsempty(),
-            "-ERR CONFIG subcommand must be one of GET, SET, RESETSTAT\r\n"));
+        addReplyError(c,
+            "CONFIG subcommand must be one of GET, SET, RESETSTAT");
     }
     return;
 
 badarity:
-    addReplySds(c,sdscatprintf(sdsempty(),
-        "-ERR Wrong number of arguments for CONFIG %s\r\n",
-        (char*) c->argv[1]->ptr));
+    addReplyErrorFormat(c,"Wrong number of arguments for CONFIG %s",
+        (char*) c->argv[1]->ptr);
 }

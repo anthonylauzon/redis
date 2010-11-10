@@ -12,7 +12,7 @@ void setGenericCommand(redisClient *c, int nx, robj *key, robj *val, robj *expir
         if (getLongFromObjectOrReply(c, expire, &seconds, NULL) != REDIS_OK)
             return;
         if (seconds <= 0) {
-            addReplySds(c,sdsnew("-ERR invalid expire time in SETEX\r\n"));
+            addReplyError(c,"invalid expire time in SETEX");
             return;
         }
     }
@@ -37,14 +37,17 @@ void setGenericCommand(redisClient *c, int nx, robj *key, robj *val, robj *expir
 }
 
 void setCommand(redisClient *c) {
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
     setGenericCommand(c,0,c->argv[1],c->argv[2],NULL);
 }
 
 void setnxCommand(redisClient *c) {
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
     setGenericCommand(c,1,c->argv[1],c->argv[2],NULL);
 }
 
 void setexCommand(redisClient *c) {
+    c->argv[3] = tryObjectEncoding(c->argv[3]);
     setGenericCommand(c,0,c->argv[1],c->argv[3],c->argv[2]);
 }
 
@@ -69,6 +72,7 @@ void getCommand(redisClient *c) {
 
 void getsetCommand(redisClient *c) {
     if (getGenericCommand(c) == REDIS_ERR) return;
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
     dbReplace(c->db,c->argv[1],c->argv[2]);
     incrRefCount(c->argv[2]);
     touchWatchedKey(c->db,c->argv[1]);
@@ -79,7 +83,7 @@ void getsetCommand(redisClient *c) {
 void mgetCommand(redisClient *c) {
     int j;
 
-    addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",c->argc-1));
+    addReplyMultiBulkLen(c,c->argc-1);
     for (j = 1; j < c->argc; j++) {
         robj *o = lookupKeyRead(c->db,c->argv[j]);
         if (o == NULL) {
@@ -98,7 +102,7 @@ void msetGenericCommand(redisClient *c, int nx) {
     int j, busykeys = 0;
 
     if ((c->argc % 2) == 0) {
-        addReplySds(c,sdsnew("-ERR wrong number of arguments for MSET\r\n"));
+        addReplyError(c,"wrong number of arguments for MSET");
         return;
     }
     /* Handle the NX flag. The MSETNX semantic is to return zero and don't
@@ -180,6 +184,7 @@ void appendCommand(redisClient *c) {
     robj *o;
 
     o = lookupKeyWrite(c->db,c->argv[1]);
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
     if (o == NULL) {
         /* Create the key */
         retval = dbAdd(c->db,c->argv[1],c->argv[2]);
@@ -211,7 +216,7 @@ void appendCommand(redisClient *c) {
     }
     touchWatchedKey(c->db,c->argv[1]);
     server.dirty++;
-    addReplySds(c,sdscatprintf(sdsempty(),":%lu\r\n",(unsigned long)totlen));
+    addReplyLongLong(c,totlen);
 }
 
 void substrCommand(redisClient *c) {
