@@ -551,6 +551,7 @@ int registerWithMaster(void) {
 /* --------------------------- REPLICATION CRON  ---------------------------- */
 
 #define REDIS_REPL_TRANSFER_TIMEOUT 60
+#define REDIS_MASTER_IO_TIMEOUT 140
 
 void replicationCron(void) {
     /* Bulk transfer I/O timeout? */
@@ -559,6 +560,17 @@ void replicationCron(void) {
     {
         redisLog(REDIS_WARNING,"Timeout receiving bulk data from MASTER...");
         replicationAbortSyncTransfer();
+    }
+
+    if (server.masterhost && server.master &&
+        server.replstate != REDIS_REPL_CONNECT &&
+        (time(NULL)-server.master->lastinteraction) > REDIS_MASTER_IO_TIMEOUT)
+    {
+      redisLog(REDIS_WARNING,"Timeout on io from MASTER...");
+      if (server.master) freeClient(server.master);
+      if (server.replstate == REDIS_REPL_TRANSFER)
+          replicationAbortSyncTransfer();
+      server.replstate = REDIS_REPL_CONNECT;
     }
 
     /* Check if we should connect to a MASTER */
