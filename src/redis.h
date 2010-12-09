@@ -386,6 +386,8 @@ struct redisServer {
     long long stat_expiredkeys;     /* number of expired keys */
     long long stat_keyspace_hits;   /* number of successful lookups of keys */
     long long stat_keyspace_misses; /* number of failed lookups of keys */
+    long long stat_numsets;         /* number of sets since boot */
+    long long stat_numsetnxs;       /* number of setnxs since boot */
     /* Configuration */
     int verbosity;
     int glueoutputbuf;

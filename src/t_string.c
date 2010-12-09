@@ -31,6 +31,13 @@ void setGenericCommand(redisClient *c, int nx, robj *key, robj *val, robj *expir
     }
     touchWatchedKey(c->db,key);
     server.dirty++;
+
+    if (nx) {
+      server.stat_numsetnxs++;
+    } else {
+      server.stat_numsets++;
+    }
+
     removeExpire(c->db,key);
     if (expire) setExpire(c->db,key,time(NULL)+seconds);
     addReply(c, nx ? shared.cone : shared.ok);
@@ -126,7 +133,15 @@ void msetGenericCommand(redisClient *c, int nx) {
         removeExpire(c->db,c->argv[j]);
         touchWatchedKey(c->db,c->argv[j]);
     }
+
     server.dirty += (c->argc-1)/2;
+
+    if (nx) {
+      server.stat_numsetnxs++;
+    } else {
+      server.stat_numsets++;
+    }
+
     addReply(c, nx ? shared.cone : shared.ok);
 }
 
