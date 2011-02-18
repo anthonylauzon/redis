@@ -1,3 +1,12 @@
+What's different about this fork?
+---------------------------------
+
+This fork is different than master in a few ways:
+1. Slaves don't sync when they connect to a master.
+2. When running multiple redis processes, backups are serialised and don't
+   occur simultaneously.
+3. You can specify how many k/v pairs to evict when maxmemory is hit.
+
 Where to find complete Redis documentation?
 -------------------------------------------
 
