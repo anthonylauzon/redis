@@ -8,9 +8,11 @@ OPTIMIZATION?=-O2
 ifeq ($(uname_S),SunOS)
   CFLAGS?= -std=c99 -pedantic $(OPTIMIZATION) -Wall -W -D__EXTENSIONS__ -D_XPG6
   CCLINK?= -ldl -lnsl -lsocket -lm -lpthread
+  DEBUG?= -g -ggdb 
 else
   CFLAGS?= -std=c99 -pedantic $(OPTIMIZATION) -Wall -W $(ARCH) $(PROF)
   CCLINK?= -lm -pthread
+  DEBUG?= -g -rdynamic -ggdb 
 endif
 
 ifeq ($(USE_TCMALLOC),yes)
@@ -18,7 +20,6 @@ ifeq ($(USE_TCMALLOC),yes)
   CFLAGS+= -DUSE_TCMALLOC
 endif
 CCOPT= $(CFLAGS) $(CCLINK) $(ARCH) $(PROF)
-DEBUG?= -g -rdynamic -ggdb 
 
 PREFIX= /usr/local
 INSTALL_BIN= $(PREFIX)/bin
@@ -37,6 +38,9 @@ CHECKDUMPPRGNAME = redis-check-dump
 CHECKAOFPRGNAME = redis-check-aof
 
 all: redis-benchmark redis-cli redis-check-dump redis-check-aof redis-server
+	@echo ""
+	@echo "Hint: To run 'make test' is a good idea ;)"
+	@echo ""
 
 # Deps (use make dep to generate this)
 adlist.o: adlist.c adlist.h zmalloc.h
@@ -102,22 +106,21 @@ ziplist.o: ziplist.c zmalloc.h ziplist.h
 zipmap.o: zipmap.c zmalloc.h
 zmalloc.o: zmalloc.c config.h
 
+dependencies:
+	cd ../deps/hiredis && $(MAKE) static ARCH="$(ARCH)"
+	cd ../deps/linenoise && $(MAKE) ARCH="$(ARCH)"
+
 redis-server: $(OBJ)
 	$(CC) -o $(PRGNAME) $(CCOPT) $(DEBUG) $(OBJ)
-	@echo ""
-	@echo "Hint: To run 'make test' is a good idea ;)"
-	@echo ""
 
-redis-benchmark: $(BENCHOBJ)
-	cd ../deps/hiredis && make static
+redis-benchmark: dependencies $(BENCHOBJ)
+	cd ../deps/hiredis && $(MAKE) static
 	$(CC) -o $(BENCHPRGNAME) $(CCOPT) $(DEBUG) $(BENCHOBJ) ../deps/hiredis/libhiredis.a
 
 redis-benchmark.o:
 	$(CC) -c $(CFLAGS) -I../deps/hiredis $(DEBUG) $(COMPILE_TIME) $<
 
-redis-cli: $(CLIOBJ)
-	cd ../deps/hiredis && make static ARCH="$(ARCH)"
-	cd ../deps/linenoise && make ARCH="$(ARCH)"
+redis-cli: dependencies $(CLIOBJ)
 	$(CC) -o $(CLIPRGNAME) $(CCOPT) $(DEBUG) $(CLIOBJ) ../deps/hiredis/libhiredis.a ../deps/linenoise/linenoise.o
 
 redis-cli.o:
@@ -134,13 +137,11 @@ redis-check-aof: $(CHECKAOFOBJ)
 
 clean:
 	rm -rf $(PRGNAME) $(BENCHPRGNAME) $(CLIPRGNAME) $(CHECKDUMPPRGNAME) $(CHECKAOFPRGNAME) *.o *.gcda *.gcno *.gcov
-	cd ../deps/hiredis && make clean
-	cd ../deps/linenoise && make clean
 
 dep:
 	$(CC) -MM *.c
 
-test:
+test: redis-server
 	(cd ..; tclsh8.5 tests/test_helper.tcl --tags "${TAGS}" --file "${FILE}")
 
 bench:
@@ -153,19 +154,19 @@ log:
 	@echo ""
 	@echo "WARNING: if it fails under Linux you probably need to install libc6-dev-i386"
 	@echo ""
-	make ARCH="-m32"
+	$(MAKE) ARCH="-m32"
 
 gprof:
-	make PROF="-pg"
+	$(MAKE) PROF="-pg"
 
 gcov:
-	make PROF="-fprofile-arcs -ftest-coverage"
+	$(MAKE) PROF="-fprofile-arcs -ftest-coverage"
 
 noopt:
-	make OPTIMIZATION=""
+	$(MAKE) OPTIMIZATION=""
 
 32bitgprof:
-	make PROF="-pg" ARCH="-arch i386"
+	$(MAKE) PROF="-pg" ARCH="-arch i386"
 
 install: all
 	mkdir -p $(INSTALL_BIN)

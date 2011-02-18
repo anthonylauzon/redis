@@ -114,6 +114,42 @@ void loadServerConfig(char *filename) {
                 }
                 fclose(logfp);
             }
+        } else if (!strcasecmp(argv[0],"syslog-enabled") && argc == 2) {
+            if ((server.syslog_enabled = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else if (!strcasecmp(argv[0],"syslog-ident") && argc == 2) {
+            if (server.syslog_ident) zfree(server.syslog_ident);
+            server.syslog_ident = zstrdup(argv[1]);
+        } else if (!strcasecmp(argv[0],"syslog-facility") && argc == 2) {
+            struct {
+                const char     *name;
+                const int       value;
+            } validSyslogFacilities[] = {
+                {"user",    LOG_USER},
+                {"local0",  LOG_LOCAL0},
+                {"local1",  LOG_LOCAL1},
+                {"local2",  LOG_LOCAL2},
+                {"local3",  LOG_LOCAL3},
+                {"local4",  LOG_LOCAL4},
+                {"local5",  LOG_LOCAL5},
+                {"local6",  LOG_LOCAL6},
+                {"local7",  LOG_LOCAL7},
+                {NULL, 0}
+            };
+            int i;
+
+            for (i = 0; validSyslogFacilities[i].name; i++) {
+                if (!strcasecmp(validSyslogFacilities[i].name, argv[1])) {
+                    server.syslog_facility = validSyslogFacilities[i].value;
+                    break;
+                }
+            }
+
+            if (!validSyslogFacilities[i].name) {
+                err = "Invalid log facility. Must be one of USER or between LOCAL0-LOCAL7";
+                goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"databases") && argc == 2) {
             server.dbnum = atoi(argv[1]);
             if (server.dbnum < 1) {
@@ -148,12 +184,6 @@ void loadServerConfig(char *filename) {
                 err = "maxmemory-samples must be 1 or greater";
                 goto loaderr;
             }
-        } else if (!strcasecmp(argv[0],"maxmemory-freecount") && argc == 2){
-            server.maxmemory_freecount = atoi(argv[1]);
-            if (server.maxmemory_freecount <= 0) {
-                err = "maxmemory-freecount must be 1 or greater";
-                goto loaderr;
-            }
         } else if (!strcasecmp(argv[0],"slaveof") && argc == 3) {
             server.masterhost = sdsnew(argv[1]);
             server.masterport = atoi(argv[2]);
@@ -164,10 +194,8 @@ void loadServerConfig(char *filename) {
             if ((server.repl_serve_stale_data = yesnotoi(argv[1])) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
             }
-        } else if (!strcasecmp(argv[0],"glueoutputbuf") && argc == 2) {
-            if ((server.glueoutputbuf = yesnotoi(argv[1])) == -1) {
-                err = "argument must be 'yes' or 'no'"; goto loaderr;
-            }
+        } else if (!strcasecmp(argv[0],"glueoutputbuf")) {
+            redisLog(REDIS_WARNING, "Deprecated configuration directive: \"%s\"", argv[0]);
         } else if (!strcasecmp(argv[0],"rdbcompression") && argc == 2) {
             if ((server.rdbcompression = yesnotoi(argv[1])) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
@@ -398,6 +426,26 @@ void configSetCommand(redisClient *c) {
 
         if (yn == -1) goto badfmt;
         server.repl_serve_stale_data = yn;
+    } else if (!strcasecmp(c->argv[2]->ptr,"dir")) {
+        if (chdir((char*)o->ptr) == -1) {
+            addReplyErrorFormat(c,"Changing directory: %s", strerror(errno));
+            return;
+        }
+    } else if (!strcasecmp(c->argv[2]->ptr,"hash-max-zipmap-entries")) {
+        if (getLongLongFromObject(o,&ll) == REDIS_ERR || ll < 0) goto badfmt;
+        server.hash_max_zipmap_entries = ll;
+    } else if (!strcasecmp(c->argv[2]->ptr,"hash-max-zipmap-value")) {
+        if (getLongLongFromObject(o,&ll) == REDIS_ERR || ll < 0) goto badfmt;
+        server.hash_max_zipmap_value = ll;
+    } else if (!strcasecmp(c->argv[2]->ptr,"list-max-ziplist-entries")) {
+        if (getLongLongFromObject(o,&ll) == REDIS_ERR || ll < 0) goto badfmt;
+        server.list_max_ziplist_entries = ll;
+    } else if (!strcasecmp(c->argv[2]->ptr,"list-max-ziplist-value")) {
+        if (getLongLongFromObject(o,&ll) == REDIS_ERR || ll < 0) goto badfmt;
+        server.list_max_ziplist_value = ll;
+    } else if (!strcasecmp(c->argv[2]->ptr,"set-max-intset-entries")) {
+        if (getLongLongFromObject(o,&ll) == REDIS_ERR || ll < 0) goto badfmt;
+        server.set_max_intset_entries = ll;
     } else {
         addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
             (char*)c->argv[2]->ptr);
@@ -420,6 +468,15 @@ void configGetCommand(redisClient *c) {
     int matches = 0;
     redisAssert(o->encoding == REDIS_ENCODING_RAW);
 
+    if (stringmatch(pattern,"dir",0)) {
+        char buf[1024];
+
+        buf[0] = '\0';
+        getcwd(buf,sizeof(buf));
+        addReplyBulkCString(c,"dir");
+        addReplyBulkCString(c,buf);
+        matches++;
+    }
     if (stringmatch(pattern,"dbfilename",0)) {
         addReplyBulkCString(c,"dbfilename");
         addReplyBulkCString(c,server.dbfilename);
@@ -511,6 +568,31 @@ void configGetCommand(redisClient *c) {
     if (stringmatch(pattern,"slave-serve-stale-data",0)) {
         addReplyBulkCString(c,"slave-serve-stale-data");
         addReplyBulkCString(c,server.repl_serve_stale_data ? "yes" : "no");
+        matches++;
+    }
+    if (stringmatch(pattern,"hash-max-zipmap-entries",0)) {
+        addReplyBulkCString(c,"hash-max-zipmap-entries");
+        addReplyBulkLongLong(c,server.hash_max_zipmap_entries);
+        matches++;
+    }
+    if (stringmatch(pattern,"hash-max-zipmap-value",0)) {
+        addReplyBulkCString(c,"hash-max-zipmap-value");
+        addReplyBulkLongLong(c,server.hash_max_zipmap_value);
+        matches++;
+    }
+    if (stringmatch(pattern,"list-max-ziplist-entries",0)) {
+        addReplyBulkCString(c,"list-max-ziplist-entries");
+        addReplyBulkLongLong(c,server.list_max_ziplist_entries);
+        matches++;
+    }
+    if (stringmatch(pattern,"list-max-ziplist-value",0)) {
+        addReplyBulkCString(c,"list-max-ziplist-value");
+        addReplyBulkLongLong(c,server.list_max_ziplist_value);
+        matches++;
+    }
+    if (stringmatch(pattern,"set-max-intset-entries",0)) {
+        addReplyBulkCString(c,"set-max-intset-entries");
+        addReplyBulkLongLong(c,server.set_max_intset_entries);
         matches++;
     }
     setDeferredMultiBulkLength(c,replylen,matches*2);

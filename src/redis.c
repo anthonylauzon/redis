@@ -74,10 +74,14 @@ struct redisCommand readonlyCommandTable[] = {
     {"setnx",setnxCommand,3,REDIS_CMD_DENYOOM,NULL,0,0,0},
     {"setex",setexCommand,4,REDIS_CMD_DENYOOM,NULL,0,0,0},
     {"append",appendCommand,3,REDIS_CMD_DENYOOM,NULL,1,1,1},
-    {"substr",substrCommand,4,0,NULL,1,1,1},
     {"strlen",strlenCommand,2,0,NULL,1,1,1},
     {"del",delCommand,-2,0,NULL,0,0,0},
     {"exists",existsCommand,2,0,NULL,1,1,1},
+    {"setbit",setbitCommand,4,REDIS_CMD_DENYOOM,NULL,1,1,1},
+    {"getbit",getbitCommand,3,0,NULL,1,1,1},
+    {"setrange",setrangeCommand,4,REDIS_CMD_DENYOOM,NULL,1,1,1},
+    {"getrange",getrangeCommand,4,0,NULL,1,1,1},
+    {"substr",getrangeCommand,4,0,NULL,1,1,1},
     {"incr",incrCommand,2,REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"decr",decrCommand,2,REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"mget",mgetCommand,-2,0,NULL,1,-1,1},
@@ -89,6 +93,7 @@ struct redisCommand readonlyCommandTable[] = {
     {"rpop",rpopCommand,2,0,NULL,1,1,1},
     {"lpop",lpopCommand,2,0,NULL,1,1,1},
     {"brpop",brpopCommand,-3,0,NULL,1,1,1},
+    {"brpoplpush",brpoplpushCommand,4,REDIS_CMD_DENYOOM,NULL,1,2,1},
     {"blpop",blpopCommand,-3,0,NULL,1,1,1},
     {"llen",llenCommand,2,0,NULL,1,1,1},
     {"lindex",lindexCommand,3,0,NULL,1,1,1},
@@ -96,7 +101,7 @@ struct redisCommand readonlyCommandTable[] = {
     {"lrange",lrangeCommand,4,0,NULL,1,1,1},
     {"ltrim",ltrimCommand,4,0,NULL,1,1,1},
     {"lrem",lremCommand,4,0,NULL,1,1,1},
-    {"rpoplpush",rpoplpushcommand,3,REDIS_CMD_DENYOOM,NULL,1,2,1},
+    {"rpoplpush",rpoplpushCommand,3,REDIS_CMD_DENYOOM,NULL,1,2,1},
     {"sadd",saddCommand,3,REDIS_CMD_DENYOOM,NULL,1,1,1},
     {"srem",sremCommand,3,0,NULL,1,1,1},
     {"smove",smoveCommand,4,0,NULL,1,2,1},
@@ -162,12 +167,10 @@ struct redisCommand readonlyCommandTable[] = {
     {"shutdown",shutdownCommand,1,0,NULL,0,0,0},
     {"lastsave",lastsaveCommand,1,0,NULL,0,0,0},
     {"type",typeCommand,2,0,NULL,1,1,1},
-    {"registerslave",registerslaveCommand,1,0,NULL,0,0,0},
     {"multi",multiCommand,1,0,NULL,0,0,0},
     {"exec",execCommand,1,REDIS_CMD_DENYOOM,execBlockClientOnSwappedKeys,0,0,0},
     {"discard",discardCommand,1,0,NULL,0,0,0},
     {"sync",syncCommand,1,0,NULL,0,0,0},
-    {"syncmaster",syncmasterCommand,1,0,NULL,0,0,0},
     {"flushdb",flushdbCommand,1,0,NULL,0,0,0},
     {"flushall",flushallCommand,1,0,NULL,0,0,0},
     {"sort",sortCommand,-2,REDIS_CMD_DENYOOM,NULL,1,1,1},
@@ -190,11 +193,13 @@ struct redisCommand readonlyCommandTable[] = {
 /*============================ Utility functions ============================ */
 
 void redisLog(int level, const char *fmt, ...) {
+    const int syslogLevelMap[] = { LOG_DEBUG, LOG_INFO, LOG_NOTICE, LOG_WARNING };
+    const char *c = ".-*#";
+    time_t now = time(NULL);
     va_list ap;
     FILE *fp;
-    char *c = ".-*#";
     char buf[64];
-    time_t now;
+    char msg[REDIS_MAX_LOGMSG_LEN];
 
     if (level < server.verbosity) return;
 
@@ -202,15 +207,16 @@ void redisLog(int level, const char *fmt, ...) {
     if (!fp) return;
 
     va_start(ap, fmt);
-    now = time(NULL);
-    strftime(buf,64,"%d %b %H:%M:%S",localtime(&now));
-    fprintf(fp,"[%d] %s %c ",(int)getpid(),buf,c[level]);
-    vfprintf(fp, fmt, ap);
-    fprintf(fp,"\n");
-    fflush(fp);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
+    strftime(buf,sizeof(buf),"%d %b %H:%M:%S",localtime(&now));
+    fprintf(fp,"[%d] %s %c %s\n",(int)getpid(),buf,c[level],msg);
+    fflush(fp);
+
     if (server.logfile) fclose(fp);
+
+    if (server.syslog_enabled) syslog(syslogLevelMap[level], "%s", msg);
 }
 
 /* Redis generally does not try to recover from out of memory conditions
@@ -510,7 +516,7 @@ void updateLRUClock(void) {
 }
 
 int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
-    int j, loops = server.cronloops++;
+    int j, loops = server.cronloops;
     REDIS_NOTUSED(eventLoop);
     REDIS_NOTUSED(id);
     REDIS_NOTUSED(clientData);
@@ -574,7 +580,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Close connections of timedout clients */
-    if ((server.maxidletime && !(loops % 100)) || server.blpop_blocked_clients)
+    if ((server.maxidletime && !(loops % 100)) || server.bpop_blocked_clients)
         closeTimedoutClients();
 
     /* Check if a background saving or AOF rewrite in progress terminated */
@@ -591,9 +597,20 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             updateDictResizePolicy();
         }
     } else {
-    	if (server.bgsaveneeded) {
-    		rdbSaveBackground(server.dbfilename);
-    	}
+        /* If there is not a background saving in progress check if
+         * we have to save now */
+         time_t now = time(NULL);
+         for (j = 0; j < server.saveparamslen; j++) {
+            struct saveparam *sp = server.saveparams+j;
+
+            if (server.dirty >= sp->changes &&
+                now-server.lastsave > sp->seconds) {
+                redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
+                    sp->changes, sp->seconds);
+                rdbSaveBackground(server.dbfilename);
+                break;
+            }
+         }
     }
 
     /* Expire a few keys per cycle, only if this is a master.
@@ -628,6 +645,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
      * to detect transfer failures. */
     if (!(loops % 10)) replicationCron();
 
+    server.cronloops++;
     return 100;
 }
 
@@ -636,15 +654,16 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
  * for ready file descriptors. */
 void beforeSleep(struct aeEventLoop *eventLoop) {
     REDIS_NOTUSED(eventLoop);
+    listNode *ln;
+    redisClient *c;
 
     /* Awake clients that got all the swapped keys they requested */
     if (server.vm_enabled && listLength(server.io_ready_clients)) {
         listIter li;
-        listNode *ln;
 
         listRewind(server.io_ready_clients,&li);
         while((ln = listNext(&li))) {
-            redisClient *c = ln->value;
+            c = ln->value;
             struct redisCommand *cmd;
 
             /* Resume the client. */
@@ -662,6 +681,20 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
                 processInputBuffer(c);
         }
     }
+
+    /* Try to process pending commands for clients that were just unblocked. */
+    while (listLength(server.unblocked_clients)) {
+        ln = listFirst(server.unblocked_clients);
+        redisAssert(ln != NULL);
+        c = ln->value;
+        listDelNode(server.unblocked_clients,ln);
+        c->flags &= ~REDIS_UNBLOCKED;
+
+        /* Process remaining data in the input buffer. */
+        if (c->querybuf && sdslen(c->querybuf) > 0)
+            processInputBuffer(c);
+    }
+
     /* Write the AOF buffer on disk */
     flushAppendOnlyFile();
 }
@@ -734,7 +767,9 @@ void initServerConfig() {
     server.saveparams = NULL;
     server.loading = 0;
     server.logfile = NULL; /* NULL = log on standard output */
-    server.glueoutputbuf = 1;
+    server.syslog_enabled = 0;
+    server.syslog_ident = zstrdup("redis");
+    server.syslog_facility = LOG_LOCAL0;
     server.daemonize = 0;
     server.appendonly = 0;
     server.appendfsync = APPENDFSYNC_EVERYSEC;
@@ -749,11 +784,10 @@ void initServerConfig() {
     server.rdbcompression = 1;
     server.activerehashing = 1;
     server.maxclients = 0;
-    server.blpop_blocked_clients = 0;
+    server.bpop_blocked_clients = 0;
     server.maxmemory = 0;
     server.maxmemory_policy = REDIS_MAXMEMORY_VOLATILE_LRU;
     server.maxmemory_samples = 3;
-    server.maxmemory_freecount = 1;
     server.vm_enabled = 0;
     server.vm_swap_file = zstrdup("/tmp/redis-%p.vm");
     server.vm_page_size = 256;          /* 256 bytes per page */
@@ -781,10 +815,7 @@ void initServerConfig() {
     server.masterport = 6379;
     server.master = NULL;
     server.replstate = REDIS_REPL_NONE;
-    server.dbsavelockfp = fopen("dbsave.lock", "a");
-    server.bgsaveneeded = 0;
     server.repl_serve_stale_data = 1;
-
 
     /* Double constants initialization */
     R_Zero = 0.0;
@@ -808,22 +839,26 @@ void initServer() {
     signal(SIGPIPE, SIG_IGN);
     setupSigSegvAction();
 
-    server.mainthread = pthread_self();
-    server.devnull = fopen("/dev/null","w");
-    if (server.devnull == NULL) {
-        redisLog(REDIS_WARNING, "Can't open /dev/null: %s", server.neterr);
-        exit(1);
+    if (server.syslog_enabled) {
+        openlog(server.syslog_ident, LOG_PID | LOG_NDELAY | LOG_NOWAIT,
+            server.syslog_facility);
     }
+
+    server.mainthread = pthread_self();
     server.clients = listCreate();
     server.slaves = listCreate();
     server.monitors = listCreate();
+    server.unblocked_clients = listCreate();
     createSharedObjects();
     server.el = aeCreateEventLoop();
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
-    server.ipfd = anetTcpServer(server.neterr,server.port,server.bindaddr);
-    if (server.ipfd == ANET_ERR) {
-        redisLog(REDIS_WARNING, "Opening port: %s", server.neterr);
-        exit(1);
+
+    if (server.port != 0) {
+        server.ipfd = anetTcpServer(server.neterr,server.port,server.bindaddr);
+        if (server.ipfd == ANET_ERR) {
+            redisLog(REDIS_WARNING, "Opening port: %s", server.neterr);
+            exit(1);
+        }
     }
     if (server.unixsocket != NULL) {
         unlink(server.unixsocket); /* don't care if this fails */
@@ -860,11 +895,10 @@ void initServer() {
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
+    server.stat_evictedkeys = 0;
     server.stat_starttime = time(NULL);
     server.stat_keyspace_misses = 0;
     server.stat_keyspace_hits = 0;
-    server.stat_numsets = 0;
-    server.stat_numsetnxs = 0;
     server.unixtime = time(NULL);
     aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL);
     if (server.ipfd > 0 && aeCreateFileEvent(server.el,server.ipfd,AE_READABLE,
@@ -1045,8 +1079,7 @@ int prepareForShutdown() {
         if (server.vm_enabled) unlink(server.vm_swap_file);
     } else if (server.saveparamslen > 0) {
         /* Snapshotting. Perform a SYNC SAVE and exit */
-    	/* alauzon: disabling save for now... */
-        if ( 0 ) { //&& (rdbSave(server.dbfilename) != REDIS_OK) ) {
+        if (rdbSave(server.dbfilename) != REDIS_OK) {
             /* Ooops.. error saving! The best we can do is to continue
              * operating. Note that if there was a background saving process,
              * in the next cron() Redis will be notified that the background
@@ -1059,7 +1092,6 @@ int prepareForShutdown() {
         redisLog(REDIS_WARNING,"Not saving DB.");
     }
     if (server.daemonize) unlink(server.pidfile);
-
     redisLog(REDIS_WARNING,"Server exit now, bye bye...");
     return REDIS_OK;
 }
@@ -1114,9 +1146,11 @@ sds genRedisInfoString(void) {
     int j;
     char hmem[64];
     struct rusage self_ru, c_ru;
+    unsigned long lol, bib;
 
     getrusage(RUSAGE_SELF, &self_ru);
     getrusage(RUSAGE_CHILDREN, &c_ru);
+    getClientsMaxBuffers(&lol,&bib);
 
     bytesToHuman(hmem,zmalloc_used_memory());
     info = sdscatprintf(sdsempty(),
@@ -1135,6 +1169,8 @@ sds genRedisInfoString(void) {
         "used_cpu_user_childrens:%.2f\r\n"
         "connected_clients:%d\r\n"
         "connected_slaves:%d\r\n"
+        "client_longest_output_list:%lu\r\n"
+        "client_biggest_input_buf:%lu\r\n"
         "blocked_clients:%d\r\n"
         "used_memory:%zu\r\n"
         "used_memory_human:%s\r\n"
@@ -1150,10 +1186,9 @@ sds genRedisInfoString(void) {
         "total_connections_received:%lld\r\n"
         "total_commands_processed:%lld\r\n"
         "expired_keys:%lld\r\n"
+        "evicted_keys:%lld\r\n"
         "keyspace_hits:%lld\r\n"
         "keyspace_misses:%lld\r\n"
-        "num_sets:%lld\r\n"
-        "num_setnxs:%lld\r\n"
         "hash_max_zipmap_entries:%zu\r\n"
         "hash_max_zipmap_value:%zu\r\n"
         "pubsub_channels:%ld\r\n"
@@ -1175,7 +1210,8 @@ sds genRedisInfoString(void) {
         (float)c_ru.ru_stime.tv_sec+(float)c_ru.ru_stime.tv_usec/1000000,
         listLength(server.clients)-listLength(server.slaves),
         listLength(server.slaves),
-        server.blpop_blocked_clients,
+        lol, bib,
+        server.bpop_blocked_clients,
         zmalloc_used_memory(),
         hmem,
         zmalloc_get_rss(),
@@ -1194,10 +1230,9 @@ sds genRedisInfoString(void) {
         server.stat_numconnections,
         server.stat_numcommands,
         server.stat_expiredkeys,
+        server.stat_evictedkeys,
         server.stat_keyspace_hits,
         server.stat_keyspace_misses,
-        server.stat_numsets,
-        server.stat_numsetnxs,
         server.hash_max_zipmap_entries,
         server.hash_max_zipmap_value,
         dictSize(server.pubsub_channels),
@@ -1288,6 +1323,19 @@ sds genRedisInfoString(void) {
             eta
         );
     }
+
+    info = sdscat(info,"allocation_stats:");
+    for (j = 0; j <= ZMALLOC_MAX_ALLOC_STAT; j++) {
+        size_t count = zmalloc_allocations_for_size(j);
+        if (count) {
+            if (info[sdslen(info)-1] != ':') info = sdscatlen(info,",",1);
+            info = sdscatprintf(info,"%s%d=%zu",
+                (j == ZMALLOC_MAX_ALLOC_STAT) ? ">=" : "",
+                j,count);
+        }
+    }
+    info = sdscat(info,"\r\n");
+
     for (j = 0; j < server.dbnum; j++) {
         long long keys, vkeys;
 
@@ -1338,115 +1386,85 @@ void freeMemoryIfNeeded(void) {
     if (server.maxmemory_policy == REDIS_MAXMEMORY_NO_EVICTION) return;
 
     while (server.maxmemory && zmalloc_used_memory() > server.maxmemory) {
-        int i, j, k, freed = 0;
-        for (i = 0; i < server.maxmemory_freecount; i++) {
-			for (j = 0; j < server.dbnum; j++) {
-				long bestval = 0; /* just to prevent warning */
-				sds bestkey = NULL;
-				struct dictEntry *de;
-				redisDb *db = server.db+j;
-				dict *dict;
-
-				if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU ||
-					server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM)
-				{
-					dict = server.db[j].dict;
-				} else {
-					dict = server.db[j].expires;
-				}
-				if (dictSize(dict) == 0) continue;
-
-				/* volatile-random and allkeys-random policy */
-				if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM ||
-					server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_RANDOM)
-				{
-					de = dictGetRandomKey(dict);
-					bestkey = dictGetEntryKey(de);
-				}
-
-				/* volatile-lru and allkeys-lru policy */
-				else if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU ||
-					server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_LRU)
-				{
-					for (k = 0; k < server.maxmemory_samples; k++) {
-						sds thiskey;
-						long thisval;
-						robj *o;
-
-						de = dictGetRandomKey(dict);
-						thiskey = dictGetEntryKey(de);
-						de = dictFind(db->dict, thiskey);
-						o = dictGetEntryVal(de);
-						thisval = estimateObjectIdleTime(o);
-
-						/* Higher idle time is better candidate for deletion */
-						if (bestkey == NULL || thisval > bestval) {
-							bestkey = thiskey;
-							bestval = thisval;
-						}
-					}
-				}
-
-				/* volatile-ttl */
-				else if (server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_TTL) {
-					for (k = 0; k < server.maxmemory_samples; k++) {
-						sds thiskey;
-						long thisval;
-
-						de = dictGetRandomKey(dict);
-						thiskey = dictGetEntryKey(de);
-						thisval = (long) dictGetEntryVal(de);
-
-						/* Expire sooner (minor expire unix timestamp) is better
-						 * candidate for deletion */
-						if (bestkey == NULL || thisval < bestval) {
-							bestkey = thiskey;
-							bestval = thisval;
-						}
-					}
-				}
-
-				/* Finally remove the selected key. */
-				if (bestkey) {
-					robj *keyobj = createStringObject(bestkey,sdslen(bestkey));
-					dbDelete(db,keyobj);
-					server.stat_expiredkeys++;
-					decrRefCount(keyobj);
-					freed++;
-				}
-			}
-        }
-        if (!freed) return; /* nothing to free... */
-    }
-
-    while(0) {
         int j, k, freed = 0;
-        for (j = 0; j < server.dbnum; j++) {
-            int minttl = -1;
-            sds minkey = NULL;
-            robj *keyobj = NULL;
-            struct dictEntry *de;
-            int i;
-            for (i = 0; i < server.maxmemory_freecount; i++) {
-				if (dictSize(server.db[j].expires)) {
-					freed = 1;
-					/* From a sample of three keys drop the one nearest to
-					 * the natural expire */
-					for (k = 0; k < 3; k++) {
-						time_t t;
 
-						de = dictGetRandomKey(server.db[j].expires);
-						t = (time_t) dictGetEntryVal(de);
-						if (minttl == -1 || t < minttl) {
-							minkey = dictGetEntryKey(de);
-							minttl = t;
-						}
-					}
-					keyobj = createStringObject(minkey,sdslen(minkey));
-					dbDelete(server.db+j,keyobj);
-					server.stat_expiredkeys++;
-					decrRefCount(keyobj);
-				}
+        for (j = 0; j < server.dbnum; j++) {
+            long bestval = 0; /* just to prevent warning */
+            sds bestkey = NULL;
+            struct dictEntry *de;
+            redisDb *db = server.db+j;
+            dict *dict;
+
+            if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU ||
+                server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM)
+            {
+                dict = server.db[j].dict;
+            } else {
+                dict = server.db[j].expires;
+            }
+            if (dictSize(dict) == 0) continue;
+
+            /* volatile-random and allkeys-random policy */
+            if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM ||
+                server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_RANDOM)
+            {
+                de = dictGetRandomKey(dict);
+                bestkey = dictGetEntryKey(de);
+            }
+
+            /* volatile-lru and allkeys-lru policy */
+            else if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU ||
+                server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_LRU)
+            {
+                for (k = 0; k < server.maxmemory_samples; k++) {
+                    sds thiskey;
+                    long thisval;
+                    robj *o;
+
+                    de = dictGetRandomKey(dict);
+                    thiskey = dictGetEntryKey(de);
+                    /* When policy is volatile-lru we need an additonal lookup
+                     * to locate the real key, as dict is set to db->expires. */
+                    if (server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_LRU)
+                        de = dictFind(db->dict, thiskey);
+                    o = dictGetEntryVal(de);
+                    thisval = estimateObjectIdleTime(o);
+
+                    /* Higher idle time is better candidate for deletion */
+                    if (bestkey == NULL || thisval > bestval) {
+                        bestkey = thiskey;
+                        bestval = thisval;
+                    }
+                }
+            }
+
+            /* volatile-ttl */
+            else if (server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_TTL) {
+                for (k = 0; k < server.maxmemory_samples; k++) {
+                    sds thiskey;
+                    long thisval;
+
+                    de = dictGetRandomKey(dict);
+                    thiskey = dictGetEntryKey(de);
+                    thisval = (long) dictGetEntryVal(de);
+
+                    /* Expire sooner (minor expire unix timestamp) is better
+                     * candidate for deletion */
+                    if (bestkey == NULL || thisval < bestval) {
+                        bestkey = thiskey;
+                        bestval = thisval;
+                    }
+                }
+            }
+
+            /* Finally remove the selected key. */
+            if (bestkey) {
+                robj *keyobj = createStringObject(bestkey,sdslen(bestkey));
+                propagateExpire(db,keyobj);
+                dbDelete(db,keyobj);
+                server.stat_evictedkeys++;
+                decrRefCount(keyobj);
+                freed++;
             }
         }
         if (!freed) return; /* nothing to free... */
@@ -1481,7 +1499,7 @@ void createPidFile(void) {
     /* Try to write the pid file in a best-effort way. */
     FILE *fp = fopen(server.pidfile,"w");
     if (fp) {
-        fprintf(fp,"%d\n",getpid());
+        fprintf(fp,"%d\n",(int)getpid());
         fclose(fp);
     }
 }

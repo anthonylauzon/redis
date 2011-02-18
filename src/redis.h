@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <syslog.h>
 
 #include "ae.h"     /* Event driven programming library */
 #include "sds.h"    /* Dynamic safe strings */
@@ -28,8 +29,6 @@
 #include "ziplist.h" /* Compact list data structure */
 #include "intset.h" /* Compact integer set structure */
 #include "version.h"
-
-#include <sys/file.h>
 
 /* Error codes */
 #define REDIS_OK                0
@@ -49,11 +48,7 @@
 #define REDIS_REQUEST_MAX_SIZE (1024*1024*256) /* max bytes in inline command */
 #define REDIS_SHARED_INTEGERS 10000
 #define REDIS_REPLY_CHUNK_BYTES (5*1500) /* 5 TCP packets with default MTU */
-
-/* If more then REDIS_WRITEV_THRESHOLD write packets are pending use writev */
-#define REDIS_WRITEV_THRESHOLD      3
-/* Max number of iovecs used for each writev call */
-#define REDIS_WRITEV_IOVEC_COUNT    256
+#define REDIS_MAX_LOGMSG_LEN    1024 /* Default maximum length of syslog messages */
 
 /* Hash table parameters */
 #define REDIS_HT_MINFILL        10      /* Minimal hash table fill 10% */
@@ -146,6 +141,8 @@
 #define REDIS_IO_WAIT 32    /* The client is waiting for Virtual Memory I/O */
 #define REDIS_DIRTY_CAS 64  /* Watched keys modified. EXEC will fail. */
 #define REDIS_CLOSE_AFTER_REPLY 128 /* Close after writing entire reply. */
+#define REDIS_UNBLOCKED 256 /* This client was unblocked and is stored in
+                               server.unblocked_clients */
 
 /* Client request types */
 #define REDIS_REQ_INLINE 1
@@ -194,11 +191,11 @@
 #define APPENDFSYNC_EVERYSEC 2
 
 /* Zip structure related defaults */
-#define REDIS_HASH_MAX_ZIPMAP_ENTRIES 64
-#define REDIS_HASH_MAX_ZIPMAP_VALUE 512
-#define REDIS_LIST_MAX_ZIPLIST_ENTRIES 1024
-#define REDIS_LIST_MAX_ZIPLIST_VALUE 32
-#define REDIS_SET_MAX_INTSET_ENTRIES 4096
+#define REDIS_HASH_MAX_ZIPMAP_ENTRIES 512
+#define REDIS_HASH_MAX_ZIPMAP_VALUE 64
+#define REDIS_LIST_MAX_ZIPLIST_ENTRIES 512
+#define REDIS_LIST_MAX_ZIPLIST_VALUE 64
+#define REDIS_SET_MAX_INTSET_ENTRIES 512
 
 /* Sets operations codes */
 #define REDIS_OP_UNION 0
@@ -212,7 +209,6 @@
 #define REDIS_MAXMEMORY_ALLKEYS_LRU 3
 #define REDIS_MAXMEMORY_ALLKEYS_RANDOM 4
 #define REDIS_MAXMEMORY_NO_EVICTION 5
-
 
 /* We can print the stacktrace, so our assert is defined this way: */
 #define redisAssert(_e) ((_e)?(void)0 : (_redisAssert(#_e,__FILE__,__LINE__),_exit(1)))
@@ -296,6 +292,16 @@ typedef struct multiState {
     int count;              /* Total number of MULTI commands */
 } multiState;
 
+typedef struct blockingState {
+    robj **keys;            /* The key we are waiting to terminate a blocking
+                             * operation such as BLPOP. Otherwise NULL. */
+    int count;              /* Number of blocking keys */
+    time_t timeout;         /* Blocking operation timeout. If UNIX current time
+                             * is >= timeout then the operation timed out. */
+    robj *target;           /* The key that should receive the element,
+                             * for BRPOPLPUSH. */
+} blockingState;
+
 /* With multiplexing we need to take per-clinet state.
  * Clients are taken in a liked list. */
 typedef struct redisClient {
@@ -319,11 +325,7 @@ typedef struct redisClient {
     long repldboff;         /* replication DB file offset */
     off_t repldbsize;       /* replication DB file size */
     multiState mstate;      /* MULTI/EXEC state */
-    robj **blocking_keys;   /* The key we are waiting to terminate a blocking
-                             * operation such as BLPOP. Otherwise NULL. */
-    int blocking_keys_num;  /* Number of blocking keys */
-    time_t blockingto;      /* Blocking operation timeout. If UNIX current time
-                             * is >= blockingto then the operation timed out. */
+    blockingState bpop;   /* blocking state */
     list *io_keys;          /* Keys this client is waiting to be loaded from the
                              * swap file in order to continue. */
     list *watched_keys;     /* Keys WATCHED for MULTI/EXEC CAS */
@@ -361,8 +363,6 @@ struct redisServer {
     int ipfd;
     int sofd;
     redisDb *db;
-    FILE *dbsavelockfp;
-    int bgsaveneeded;
     long long dirty;            /* changes to DB from the last save */
     long long dirty_before_bgsave; /* used to restore dirty on failed BGSAVE */
     list *clients;
@@ -384,13 +384,11 @@ struct redisServer {
     long long stat_numcommands;     /* number of processed commands */
     long long stat_numconnections;  /* number of connections received */
     long long stat_expiredkeys;     /* number of expired keys */
+    long long stat_evictedkeys;     /* number of evicted keys (maxmemory) */
     long long stat_keyspace_hits;   /* number of successful lookups of keys */
     long long stat_keyspace_misses; /* number of failed lookups of keys */
-    long long stat_numsets;         /* number of sets since boot */
-    long long stat_numsetnxs;       /* number of setnxs since boot */
     /* Configuration */
     int verbosity;
-    int glueoutputbuf;
     int maxidletime;
     int dbnum;
     int daemonize;
@@ -409,6 +407,9 @@ struct redisServer {
     struct saveparam *saveparams;
     int saveparamslen;
     char *logfile;
+    int syslog_enabled;
+    char *syslog_ident;
+    int syslog_facility;
     char *dbfilename;
     char *appendfilename;
     char *requirepass;
@@ -433,10 +434,10 @@ struct redisServer {
     unsigned long long maxmemory;
     int maxmemory_policy;
     int maxmemory_samples;
-    int maxmemory_freecount;
     /* Blocked clients */
-    unsigned int blpop_blocked_clients;
+    unsigned int bpop_blocked_clients;
     unsigned int vm_blocked_clients;
+    list *unblocked_clients;
     /* Sort parameters - qsort_r() is only available under BSD so we
      * have to take this state global, in order to pass it to sortCompare() */
     int sort_desc;
@@ -489,7 +490,6 @@ struct redisServer {
     dict *pubsub_channels; /* Map channels to list of subscribed clients */
     list *pubsub_patterns; /* A list of pubsub_patterns */
     /* Misc */
-    FILE *devnull;
     unsigned lruclock:22;        /* clock incrementing every minute, for LRU */
     unsigned lruclock_padding:10;
 };
@@ -637,7 +637,6 @@ void closeTimedoutClients(void);
 void freeClient(redisClient *c);
 void resetClient(redisClient *c);
 void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask);
-void sendReplyToClientWritev(aeEventLoop *el, int fd, void *privdata, int mask);
 void addReply(redisClient *c, robj *obj);
 void *addDeferredMultiBulkLength(redisClient *c);
 void setDeferredMultiBulkLength(redisClient *c, void *node, long length);
@@ -648,6 +647,8 @@ void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask);
 void addReplyBulk(redisClient *c, robj *obj);
 void addReplyBulkCString(redisClient *c, char *s);
+void addReplyBulkCBuffer(redisClient *c, void *p, size_t len);
+void addReplyBulkLongLong(redisClient *c, long long ll);
 void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void addReply(redisClient *c, robj *obj);
 void addReplySds(redisClient *c, sds s);
@@ -657,6 +658,8 @@ void addReplyDouble(redisClient *c, double d);
 void addReplyLongLong(redisClient *c, long long ll);
 void addReplyMultiBulkLen(redisClient *c, long length);
 void *dupClientReplyValue(void *o);
+void getClientsMaxBuffers(unsigned long *longest_output_list,
+                          unsigned long *biggest_input_buffer);
 
 #ifdef __GNUC__
 void addReplyErrorFormat(redisClient *c, const char *fmt, ...)
@@ -738,11 +741,6 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc);
 void replicationFeedMonitors(list *monitors, int dictid, robj **argv, int argc);
 int syncWithMaster(void);
 void updateSlavesWaitingBgsave(int bgsaveerr);
-
-void syncmasterCommand(redisClient *c);
-void registerslaveCommand(redisClient *c);
-int registerWithMaster(void);
-
 void replicationCron(void);
 
 /* Generic persistence functions */
@@ -750,15 +748,14 @@ void startLoading(FILE *fp);
 void loadingProgress(off_t pos);
 void stopLoading(void);
 
-
 /* RDB persistence */
 int rdbLoad(char *filename);
 int rdbSaveBackground(char *filename);
 void rdbRemoveTempFile(pid_t childpid);
 int rdbSave(char *filename);
 int rdbSaveObject(FILE *fp, robj *o);
-off_t rdbSavedObjectPages(robj *o, FILE *fp);
-off_t rdbSavedObjectLen(robj *o, FILE *fp);
+off_t rdbSavedObjectLen(robj *o);
+off_t rdbSavedObjectPages(robj *o);
 robj *rdbLoadObject(int type, FILE *fp);
 void backgroundSaveDoneHandler(int statloc);
 
@@ -826,8 +823,9 @@ int setTypeRemove(robj *subject, robj *value);
 int setTypeIsMember(robj *subject, robj *value);
 setTypeIterator *setTypeInitIterator(robj *subject);
 void setTypeReleaseIterator(setTypeIterator *si);
-robj *setTypeNext(setTypeIterator *si);
-robj *setTypeRandomElement(robj *subject);
+int setTypeNext(setTypeIterator *si, robj **objele, int64_t *llele);
+robj *setTypeNextObject(setTypeIterator *si);
+int setTypeRandomElement(robj *setobj, robj **objele, int64_t *llele);
 unsigned long setTypeSize(robj *subject);
 void setTypeConvert(robj *subject, int enc);
 
@@ -835,7 +833,8 @@ void setTypeConvert(robj *subject, int enc);
 void convertToRealHash(robj *o);
 void hashTypeTryConversion(robj *subject, robj **argv, int start, int end);
 void hashTypeTryObjectEncoding(robj *subject, robj **o1, robj **o2);
-robj *hashTypeGet(robj *o, robj *key);
+int hashTypeGet(robj *o, robj *key, robj **objval, unsigned char **v, unsigned int *vlen);
+robj *hashTypeGetObject(robj *o, robj *key);
 int hashTypeExists(robj *o, robj *key);
 int hashTypeSet(robj *o, robj *key, robj *value);
 int hashTypeDelete(robj *o, robj *key);
@@ -843,7 +842,8 @@ unsigned long hashTypeLength(robj *o);
 hashTypeIterator *hashTypeInitIterator(robj *subject);
 void hashTypeReleaseIterator(hashTypeIterator *hi);
 int hashTypeNext(hashTypeIterator *hi);
-robj *hashTypeCurrent(hashTypeIterator *hi, int what);
+int hashTypeCurrent(hashTypeIterator *hi, int what, robj **objval, unsigned char **v, unsigned int *vlen);
+robj *hashTypeCurrentObject(hashTypeIterator *hi, int what);
 robj *hashTypeLookupWriteOrCreate(redisClient *c, robj *key);
 
 /* Pub / Sub */
@@ -900,6 +900,10 @@ void setexCommand(redisClient *c);
 void getCommand(redisClient *c);
 void delCommand(redisClient *c);
 void existsCommand(redisClient *c);
+void setbitCommand(redisClient *c);
+void getbitCommand(redisClient *c);
+void setrangeCommand(redisClient *c);
+void getrangeCommand(redisClient *c);
 void incrCommand(redisClient *c);
 void decrCommand(redisClient *c);
 void incrbyCommand(redisClient *c);
@@ -947,7 +951,7 @@ void flushdbCommand(redisClient *c);
 void flushallCommand(redisClient *c);
 void sortCommand(redisClient *c);
 void lremCommand(redisClient *c);
-void rpoplpushcommand(redisClient *c);
+void rpoplpushCommand(redisClient *c);
 void infoCommand(redisClient *c);
 void mgetCommand(redisClient *c);
 void monitorCommand(redisClient *c);
@@ -976,8 +980,8 @@ void execCommand(redisClient *c);
 void discardCommand(redisClient *c);
 void blpopCommand(redisClient *c);
 void brpopCommand(redisClient *c);
+void brpoplpushCommand(redisClient *c);
 void appendCommand(redisClient *c);
-void substrCommand(redisClient *c);
 void strlenCommand(redisClient *c);
 void zrankCommand(redisClient *c);
 void zrevrankCommand(redisClient *c);
