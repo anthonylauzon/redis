@@ -18,6 +18,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <syslog.h>
+#include <sys/file.h>
 
 #include "ae.h"     /* Event driven programming library */
 #include "sds.h"    /* Dynamic safe strings */
@@ -363,6 +364,8 @@ struct redisServer {
     int ipfd;
     int sofd;
     redisDb *db;
+    FILE *dbsavelockfp;
+    int bgsaveneeded;
     long long dirty;            /* changes to DB from the last save */
     long long dirty_before_bgsave; /* used to restore dirty on failed BGSAVE */
     list *clients;
@@ -387,6 +390,8 @@ struct redisServer {
     long long stat_evictedkeys;     /* number of evicted keys (maxmemory) */
     long long stat_keyspace_hits;   /* number of successful lookups of keys */
     long long stat_keyspace_misses; /* number of failed lookups of keys */
+    long long stat_numsets;         /* number of sets since boot */
+    long long stat_numsetnxs;       /* number of setnxs since boot */
     /* Configuration */
     int verbosity;
     int maxidletime;
@@ -434,6 +439,7 @@ struct redisServer {
     unsigned long long maxmemory;
     int maxmemory_policy;
     int maxmemory_samples;
+    int maxmemory_freecount;
     /* Blocked clients */
     unsigned int bpop_blocked_clients;
     unsigned int vm_blocked_clients;
@@ -741,6 +747,11 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc);
 void replicationFeedMonitors(list *monitors, int dictid, robj **argv, int argc);
 int syncWithMaster(void);
 void updateSlavesWaitingBgsave(int bgsaveerr);
+
+void syncmasterCommand(redisClient *c);
+void registerslaveCommand(redisClient *c);
+int registerWithMaster(void);
+
 void replicationCron(void);
 
 /* Generic persistence functions */

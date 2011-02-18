@@ -492,6 +492,72 @@ void slaveofCommand(redisClient *c) {
     addReply(c,shared.ok);
 }
 
+void syncmasterCommand(redisClient *c) {
+    redisLog(REDIS_NOTICE,"Connecting to MASTER...");
+     if (syncWithMaster() == REDIS_OK) {
+    	 redisLog(REDIS_NOTICE,"MASTER <-> SLAVE sync succeeded");
+     }
+}
+
+void registerslaveCommand(redisClient *c) {
+    /* ignore registerslave if aleady slave or in monitor mode */
+    if (c->flags & REDIS_SLAVE) return;
+    c->repldbfd = -1;
+    c->flags |= REDIS_SLAVE;
+    c->slaveseldb = 0;
+    listAddNodeTail(server.slaves,c);
+    return;
+}
+
+int registerWithMaster(void) {
+    char buf[1024], authcmd[1024];
+
+    int fd = anetTcpConnect(NULL,server.masterhost,server.masterport);
+
+    if (fd == -1) {
+        redisLog(REDIS_WARNING,"Unable to connect to MASTER: %s",
+            strerror(errno));
+        return REDIS_ERR;
+    }
+
+    /* AUTH with the master if required. */
+    if(server.masterauth) {
+    	snprintf(authcmd, 1024, "AUTH %s\r\n", server.masterauth);
+    	if (syncWrite(fd, authcmd, strlen(server.masterauth)+7, 5) == -1) {
+            close(fd);
+            redisLog(REDIS_WARNING,"Unable to AUTH to MASTER: %s",
+                strerror(errno));
+            return REDIS_ERR;
+    	}
+        /* Read the AUTH result.  */
+        if (syncReadLine(fd,buf,1024,3600) == -1) {
+            close(fd);
+            redisLog(REDIS_WARNING,"I/O error reading auth result from MASTER: %s",
+                strerror(errno));
+            return REDIS_ERR;
+        }
+        if (buf[0] != '+') {
+            close(fd);
+            redisLog(REDIS_WARNING,"Cannot AUTH to MASTER, is the masterauth password correct?");
+            return REDIS_ERR;
+        }
+    }
+
+
+    /* Issue the REGISTERSLAVE command */
+    if (syncWrite(fd,"REGISTERSLAVE \r\n",16,5) == -1) {
+        close(fd);
+        redisLog(REDIS_WARNING,"I/O error writing to MASTER: %s",
+            strerror(errno));
+        return REDIS_ERR;
+    }
+
+    server.master = createClient(fd);
+    server.master->flags |= REDIS_MASTER;
+    server.master->authenticated = 1;
+    server.replstate = REDIS_REPL_CONNECTED;
+    return REDIS_OK;
+}
 /* --------------------------- REPLICATION CRON  ---------------------------- */
 
 #define REDIS_REPL_TIMEOUT 60
@@ -517,8 +583,8 @@ void replicationCron(void) {
     /* Check if we should connect to a MASTER */
     if (server.replstate == REDIS_REPL_CONNECT) {
         redisLog(REDIS_NOTICE,"Connecting to MASTER...");
-        if (syncWithMaster() == REDIS_OK) {
-            redisLog(REDIS_NOTICE,"MASTER <-> SLAVE sync started: SYNC sent");
+        if (registerWithMaster() == REDIS_OK) {
+            redisLog(REDIS_NOTICE,"MASTER <-> SLAVE registration succeeded");
             if (server.appendonly) rewriteAppendOnlyFileBackground();
         }
     }

@@ -187,7 +187,9 @@ struct redisCommand readonlyCommandTable[] = {
     {"punsubscribe",punsubscribeCommand,-1,0,NULL,0,0,0},
     {"publish",publishCommand,3,REDIS_CMD_FORCE_REPLICATION,NULL,0,0,0},
     {"watch",watchCommand,-2,0,NULL,0,0,0},
-    {"unwatch",unwatchCommand,1,0,NULL,0,0,0}
+    {"unwatch",unwatchCommand,1,0,NULL,0,0,0},
+    {"registerslave",registerslaveCommand,1,0,NULL,0,0,0}, 
+    {"syncmaster",syncmasterCommand,1,0,NULL,0,0,0}
 };
 
 /*============================ Utility functions ============================ */
@@ -597,20 +599,9 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             updateDictResizePolicy();
         }
     } else {
-        /* If there is not a background saving in progress check if
-         * we have to save now */
-         time_t now = time(NULL);
-         for (j = 0; j < server.saveparamslen; j++) {
-            struct saveparam *sp = server.saveparams+j;
-
-            if (server.dirty >= sp->changes &&
-                now-server.lastsave > sp->seconds) {
-                redisLog(REDIS_NOTICE,"%d changes in %d seconds. Saving...",
-                    sp->changes, sp->seconds);
-                rdbSaveBackground(server.dbfilename);
-                break;
-            }
-         }
+    	if (server.bgsaveneeded) {
+    		rdbSaveBackground(server.dbfilename);
+    	}
     }
 
     /* Expire a few keys per cycle, only if this is a master.
@@ -788,6 +779,7 @@ void initServerConfig() {
     server.maxmemory = 0;
     server.maxmemory_policy = REDIS_MAXMEMORY_VOLATILE_LRU;
     server.maxmemory_samples = 3;
+    server.maxmemory_freecount = 1;
     server.vm_enabled = 0;
     server.vm_swap_file = zstrdup("/tmp/redis-%p.vm");
     server.vm_page_size = 256;          /* 256 bytes per page */
@@ -815,6 +807,8 @@ void initServerConfig() {
     server.masterport = 6379;
     server.master = NULL;
     server.replstate = REDIS_REPL_NONE;
+    server.dbsavelockfp = fopen("dbsave.lock", "a");
+    server.bgsaveneeded = 0;
     server.repl_serve_stale_data = 1;
 
     /* Double constants initialization */
@@ -899,6 +893,8 @@ void initServer() {
     server.stat_starttime = time(NULL);
     server.stat_keyspace_misses = 0;
     server.stat_keyspace_hits = 0;
+    server.stat_numsets = 0;
+    server.stat_numsetnxs = 0;
     server.unixtime = time(NULL);
     aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL);
     if (server.ipfd > 0 && aeCreateFileEvent(server.el,server.ipfd,AE_READABLE,
@@ -1079,7 +1075,8 @@ int prepareForShutdown() {
         if (server.vm_enabled) unlink(server.vm_swap_file);
     } else if (server.saveparamslen > 0) {
         /* Snapshotting. Perform a SYNC SAVE and exit */
-        if (rdbSave(server.dbfilename) != REDIS_OK) {
+    	/* alauzon: disabling save for now... */
+        if ( 0 ) { //&& (rdbSave(server.dbfilename) != REDIS_OK) ) {
             /* Ooops.. error saving! The best we can do is to continue
              * operating. Note that if there was a background saving process,
              * in the next cron() Redis will be notified that the background
@@ -1189,6 +1186,8 @@ sds genRedisInfoString(void) {
         "evicted_keys:%lld\r\n"
         "keyspace_hits:%lld\r\n"
         "keyspace_misses:%lld\r\n"
+        "num_sets:%lld\r\n"
+        "num_setnxs:%lld\r\n"
         "hash_max_zipmap_entries:%zu\r\n"
         "hash_max_zipmap_value:%zu\r\n"
         "pubsub_channels:%ld\r\n"
@@ -1233,6 +1232,8 @@ sds genRedisInfoString(void) {
         server.stat_evictedkeys,
         server.stat_keyspace_hits,
         server.stat_keyspace_misses,
+        server.stat_numsets,
+        server.stat_numsetnxs,
         server.hash_max_zipmap_entries,
         server.hash_max_zipmap_value,
         dictSize(server.pubsub_channels),
@@ -1386,88 +1387,89 @@ void freeMemoryIfNeeded(void) {
     if (server.maxmemory_policy == REDIS_MAXMEMORY_NO_EVICTION) return;
 
     while (server.maxmemory && zmalloc_used_memory() > server.maxmemory) {
-        int j, k, freed = 0;
+        int i, j, k, freed = 0;
+        for (i = 0; i < server.maxmemory_freecount; i++) {
+			for (j = 0; j < server.dbnum; j++) {
+				long bestval = 0; /* just to prevent warning */
+				sds bestkey = NULL;
+				struct dictEntry *de;
+				redisDb *db = server.db+j;
+				dict *dict;
 
-        for (j = 0; j < server.dbnum; j++) {
-            long bestval = 0; /* just to prevent warning */
-            sds bestkey = NULL;
-            struct dictEntry *de;
-            redisDb *db = server.db+j;
-            dict *dict;
+				if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU ||
+					server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM)
+				{
+					dict = server.db[j].dict;
+				} else {
+					dict = server.db[j].expires;
+				}
+				if (dictSize(dict) == 0) continue;
 
-            if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU ||
-                server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM)
-            {
-                dict = server.db[j].dict;
-            } else {
-                dict = server.db[j].expires;
-            }
-            if (dictSize(dict) == 0) continue;
+				/* volatile-random and allkeys-random policy */
+				if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM ||
+					server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_RANDOM)
+				{
+					de = dictGetRandomKey(dict);
+					bestkey = dictGetEntryKey(de);
+				}
 
-            /* volatile-random and allkeys-random policy */
-            if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_RANDOM ||
-                server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_RANDOM)
-            {
-                de = dictGetRandomKey(dict);
-                bestkey = dictGetEntryKey(de);
-            }
+				/* volatile-lru and allkeys-lru policy */
+				else if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU ||
+					server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_LRU)
+				{
+					for (k = 0; k < server.maxmemory_samples; k++) {
+						sds thiskey;
+						long thisval;
+						robj *o;
 
-            /* volatile-lru and allkeys-lru policy */
-            else if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU ||
-                server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_LRU)
-            {
-                for (k = 0; k < server.maxmemory_samples; k++) {
-                    sds thiskey;
-                    long thisval;
-                    robj *o;
+						de = dictGetRandomKey(dict);
+						thiskey = dictGetEntryKey(de);
+						/* When policy is volatile-lru we need an additonal lookup
+						 * to locate the real key, as dict is set to db->expires. */
+						if (server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_LRU)
+							de = dictFind(db->dict, thiskey);
+						o = dictGetEntryVal(de);
+						thisval = estimateObjectIdleTime(o);
 
-                    de = dictGetRandomKey(dict);
-                    thiskey = dictGetEntryKey(de);
-                    /* When policy is volatile-lru we need an additonal lookup
-                     * to locate the real key, as dict is set to db->expires. */
-                    if (server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_LRU)
-                        de = dictFind(db->dict, thiskey);
-                    o = dictGetEntryVal(de);
-                    thisval = estimateObjectIdleTime(o);
+						/* Higher idle time is better candidate for deletion */
+						if (bestkey == NULL || thisval > bestval) {
+							bestkey = thiskey;
+							bestval = thisval;
+						}
+					}
+				}
 
-                    /* Higher idle time is better candidate for deletion */
-                    if (bestkey == NULL || thisval > bestval) {
-                        bestkey = thiskey;
-                        bestval = thisval;
-                    }
-                }
-            }
+				/* volatile-ttl */
+				else if (server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_TTL) {
+					for (k = 0; k < server.maxmemory_samples; k++) {
+						sds thiskey;
+						long thisval;
 
-            /* volatile-ttl */
-            else if (server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_TTL) {
-                for (k = 0; k < server.maxmemory_samples; k++) {
-                    sds thiskey;
-                    long thisval;
+						de = dictGetRandomKey(dict);
+						thiskey = dictGetEntryKey(de);
+						thisval = (long) dictGetEntryVal(de);
 
-                    de = dictGetRandomKey(dict);
-                    thiskey = dictGetEntryKey(de);
-                    thisval = (long) dictGetEntryVal(de);
+						/* Expire sooner (minor expire unix timestamp) is better
+						 * candidate for deletion */
+						if (bestkey == NULL || thisval < bestval) {
+							bestkey = thiskey;
+							bestval = thisval;
+						}
+					}
+				}
 
-                    /* Expire sooner (minor expire unix timestamp) is better
-                     * candidate for deletion */
-                    if (bestkey == NULL || thisval < bestval) {
-                        bestkey = thiskey;
-                        bestval = thisval;
-                    }
-                }
-            }
-
-            /* Finally remove the selected key. */
-            if (bestkey) {
-                robj *keyobj = createStringObject(bestkey,sdslen(bestkey));
-                propagateExpire(db,keyobj);
-                dbDelete(db,keyobj);
-                server.stat_evictedkeys++;
-                decrRefCount(keyobj);
-                freed++;
-            }
-        }
-        if (!freed) return; /* nothing to free... */
+				/* Finally remove the selected key. */
+				if (bestkey) {
+					robj *keyobj = createStringObject(bestkey,sdslen(bestkey));
+					propagateExpire(db,keyobj);
+					dbDelete(db,keyobj);
+					server.stat_evictedkeys++;
+					decrRefCount(keyobj);
+					freed++;
+				}
+			}
+			if (!freed) return; /* nothing to free... */
+		}
     }
 }
 

@@ -184,6 +184,12 @@ void loadServerConfig(char *filename) {
                 err = "maxmemory-samples must be 1 or greater";
                 goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"maxmemory-freecount") && argc == 2){
+            server.maxmemory_freecount = atoi(argv[1]);
+            if (server.maxmemory_freecount <= 0) {
+                err = "maxmemory-freecount must be 1 or greater";
+                goto loaderr;
+            }
         } else if (!strcasecmp(argv[0],"slaveof") && argc == 3) {
             server.masterhost = sdsnew(argv[1]);
             server.masterport = atoi(argv[2]);
