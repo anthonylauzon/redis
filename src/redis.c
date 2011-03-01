@@ -912,6 +912,7 @@ void initServer() {
     }
 
     if (server.vm_enabled) vmInit();
+    srand(time(NULL)^getpid());
 }
 
 /* Populates the Redis Command Table starting from the hard coded list

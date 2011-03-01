@@ -66,7 +66,7 @@ void loadServerConfig(char *filename) {
             }
         } else if (!strcasecmp(argv[0],"port") && argc == 2) {
             server.port = atoi(argv[1]);
-            if (server.port < 1 || server.port > 65535) {
+            if (server.port < 0 || server.port > 65535) {
                 err = "Invalid port"; goto loaderr;
             }
         } else if (!strcasecmp(argv[0],"bind") && argc == 2) {
@@ -477,10 +477,12 @@ void configGetCommand(redisClient *c) {
     if (stringmatch(pattern,"dir",0)) {
         char buf[1024];
 
-        buf[0] = '\0';
-        getcwd(buf,sizeof(buf));
         addReplyBulkCString(c,"dir");
-        addReplyBulkCString(c,buf);
+        if (getcwd(buf,sizeof(buf)) == NULL) {
+            buf[0] = '\0';
+        } else {
+            addReplyBulkCString(c,buf);
+        }
         matches++;
     }
     if (stringmatch(pattern,"dbfilename",0)) {
